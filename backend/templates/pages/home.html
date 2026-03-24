@@ -1,0 +1,25 @@
+﻿{% extends "base.html" %}
+
+{% block content %}
+<div class="stack">
+    <p>
+        The backend is now organized around Django routes and template shells first.
+        The future frontend can replace these pages gradually while keeping the same URL structure.
+    </p>
+    <div class="card-grid">
+        <article class="mini-card">
+            <h3>Client Shell</h3>
+            <p>Login, survey, capture, and recommendation entry points.</p>
+        </article>
+        <article class="mini-card">
+            <h3>Admin Shell</h3>
+            <p>Admin login and dashboard placeholders mapped to Django APIs.</p>
+        </article>
+        <article class="mini-card">
+            <h3>Supabase-ready</h3>
+            <p>Database and storage can switch to Supabase through environment settings.</p>
+        </article>
+    </div>
+</div>
+{% endblock %}
+

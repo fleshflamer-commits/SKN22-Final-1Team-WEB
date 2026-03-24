@@ -30,7 +30,6 @@ mirrai.db
 media/
 storage/
 staticfiles/
-static/
 server_log.txt
 
 # Virtual Environment
