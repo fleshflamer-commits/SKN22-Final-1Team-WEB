@@ -1,0 +1,51 @@
+﻿{% load static %}
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ page_title }} | MirrAI</title>
+    <link rel="stylesheet" href="{% static 'app.css' %}">
+</head>
+<body>
+    <div class="page-shell">
+        <header class="hero">
+            <div class="hero__copy">
+                <p class="eyebrow">MirrAI Django-first Scaffold</p>
+                <h1>{{ page_title }}</h1>
+                <p class="subtitle">{{ page_subtitle }}</p>
+            </div>
+            <nav class="hero__nav">
+                <a href="/">Home</a>
+                <a href="/client/login/">Client</a>
+                <a href="/admin-panel/login/">Admin</a>
+                <a href="/docs/">API Docs</a>
+            </nav>
+        </header>
+
+        <main class="content-grid">
+            <section class="panel">
+                <h2>Template Notes</h2>
+                <p>
+                    This page is a Django template shell so the frontend can be reconnected
+                    to the backend with stable routes before the final UI rewrite lands.
+                </p>
+                {% block content %}{% endblock %}
+            </section>
+
+            <aside class="panel">
+                <h2>API Map</h2>
+                <ul class="api-list">
+                    {% for item in api_map %}
+                    <li>
+                        <strong>{{ item.label }}</strong>
+                        <code>{{ item.value }}</code>
+                    </li>
+                    {% endfor %}
+                </ul>
+            </aside>
+        </main>
+    </div>
+</body>
+</html>
+

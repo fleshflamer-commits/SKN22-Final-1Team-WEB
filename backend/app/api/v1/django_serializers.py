@@ -34,6 +34,8 @@ class ClientSerializer(serializers.ModelSerializer):
             "phone",
             "age_input",
             "birth_year_estimate",
+            "image_storage_consent",
+            "image_storage_consented_at",
             "current_age",
             "age_decade",
             "age_segment",
@@ -130,14 +132,20 @@ class FormerRecommendationSerializer(serializers.ModelSerializer):
 
 
 class RecommendationCardSerializer(serializers.Serializer):
+    id = serializers.IntegerField(required=False)
     recommendation_id = serializers.IntegerField(required=False)
     batch_id = serializers.UUIDField(required=False, allow_null=True)
     source = serializers.CharField()
     style_id = serializers.IntegerField()
     style_name = serializers.CharField()
+    name = serializers.CharField(required=False)
+    name_en = serializers.CharField(required=False, allow_blank=True)
     style_description = serializers.CharField(required=False, allow_blank=True)
+    description = serializers.CharField(required=False, allow_blank=True)
     keywords = serializers.ListField(child=serializers.CharField(), required=False)
+    tags = serializers.ListField(child=serializers.CharField(), required=False)
     sample_image_url = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    imageUrl = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     simulation_image_url = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     synthetic_image_url = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     llm_explanation = serializers.CharField(required=False, allow_blank=True)
@@ -146,6 +154,7 @@ class RecommendationCardSerializer(serializers.Serializer):
     image_policy = serializers.CharField(required=False)
     can_regenerate_simulation = serializers.BooleanField(required=False)
     match_score = serializers.FloatField(required=False)
+    match = serializers.IntegerField(required=False)
     rank = serializers.IntegerField(required=False)
     is_chosen = serializers.BooleanField(required=False)
     created_at = serializers.DateTimeField(required=False)
@@ -154,6 +163,7 @@ class RecommendationCardSerializer(serializers.Serializer):
 class RecommendationListResponseSerializer(serializers.Serializer):
     status = serializers.CharField()
     source = serializers.CharField(required=False)
+    recommendation_mode = serializers.CharField(required=False)
     batch_id = serializers.UUIDField(required=False, allow_null=True)
     days = serializers.IntegerField(required=False)
     trend_scope = serializers.CharField(required=False)
@@ -161,6 +171,7 @@ class RecommendationListResponseSerializer(serializers.Serializer):
     message = serializers.CharField(required=False)
     next_action = serializers.CharField(required=False)
     next_actions = serializers.ListField(child=serializers.CharField(), required=False)
+    capture_required_for_full_result = serializers.BooleanField(required=False)
     items = RecommendationCardSerializer(many=True)
 
 
@@ -180,11 +191,17 @@ class ClientRegisterSerializer(serializers.Serializer):
     phone = serializers.CharField()
     age = serializers.IntegerField(required=False)
     ages = serializers.IntegerField(required=False)
+    agree_image_storage = serializers.BooleanField(required=False, default=False)
+    image_storage_consent = serializers.BooleanField(required=False)
 
     def validate(self, attrs):
         raw_age = attrs.pop("age", None)
         if raw_age is None:
             raw_age = attrs.pop("ages", None)
+        explicit_image_storage_consent = attrs.pop("image_storage_consent", None)
+        agree_image_storage = attrs.pop("agree_image_storage", False)
+        if explicit_image_storage_consent is None:
+            explicit_image_storage_consent = agree_image_storage
         try:
             age = normalize_age_input(raw_age)
         except ValueError as exc:
@@ -192,8 +209,13 @@ class ClientRegisterSerializer(serializers.Serializer):
 
         attrs["age_input"] = age
         attrs["birth_year_estimate"] = estimate_birth_year_from_age(age)
+        attrs["image_storage_consent"] = bool(explicit_image_storage_consent)
         return attrs
 
     def create(self, validated_data):
+        if validated_data.get("image_storage_consent"):
+            from django.utils import timezone
+
+            validated_data["image_storage_consented_at"] = timezone.now()
         return Client.objects.create(**validated_data)
 

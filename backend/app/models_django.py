@@ -9,6 +9,8 @@ class Client(models.Model):
     phone = models.CharField(max_length=20, unique=True, db_index=True)
     age_input = models.PositiveSmallIntegerField(null=True, blank=True)
     birth_year_estimate = models.PositiveSmallIntegerField(null=True, blank=True, db_index=True)
+    image_storage_consent = models.BooleanField(default=False)
+    image_storage_consented_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -29,6 +31,8 @@ class AdminAccount(models.Model):
     phone = models.CharField(max_length=20, unique=True, db_index=True)
     business_number = models.CharField(max_length=30, unique=True, db_index=True)
     password_hash = models.CharField(max_length=255)
+    business_verification_status = models.CharField(max_length=30, default="checksum_only")
+    business_verification_snapshot = models.JSONField(default=dict, blank=True)
     consent_snapshot = models.JSONField(default=dict, blank=True)
     consented_at = models.DateTimeField(null=True, blank=True)
     is_active = models.BooleanField(default=True)

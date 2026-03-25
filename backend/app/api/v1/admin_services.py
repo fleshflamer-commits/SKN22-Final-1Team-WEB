@@ -10,9 +10,16 @@ from django.utils import timezone
 
 from app.api.v1.admin_auth import TOKEN_MAX_AGE_SECONDS, build_admin_token
 from app.api.v1.recommendation_logic import STYLE_CATALOG
-from app.api.v1.services_django import ensure_catalog_styles, get_latest_analysis, get_latest_survey, serialize_recommendation_row
+from app.api.v1.services_django import (
+    ensure_catalog_styles,
+    get_latest_analysis,
+    get_latest_capture_attempt,
+    get_latest_survey,
+    serialize_recommendation_row,
+)
 from app.models_django import AdminAccount, CaptureRecord, ConsultationRequest, Client, ClientSessionNote, FormerRecommendation, Style, StyleSelection
 from app.services.age_profile import build_client_age_profile
+from app.services.business_verification import verify_business_number
 from app.services.storage_service import resolve_storage_reference
 
 
@@ -142,6 +149,75 @@ def _style_snapshot(style_id: int) -> dict:
     }
 
 
+def _style_catalog_profile(style_id: int):
+    return next((item for item in STYLE_CATALOG if item.style_id == style_id), None)
+
+
+def _budget_tags_to_price_range(budget_tags: tuple[str, ...] | list[str] | None) -> str | None:
+    if not budget_tags:
+        return None
+    normalized = list(budget_tags)
+    if normalized == ["low"]:
+        return "5만원 이하"
+    if normalized == ["mid"]:
+        return "5~10만원"
+    if normalized == ["high"]:
+        return "10만원 이상"
+    if normalized == ["low", "mid"]:
+        return "5~10만원"
+    if normalized == ["mid", "high"]:
+        return "8~15만원"
+    return " / ".join(normalized)
+
+
+def _style_tags_to_length(length_tags: tuple[str, ...] | list[str] | None) -> str | None:
+    if not length_tags:
+        return None
+    mapping = {
+        "short": "숏",
+        "bob": "보브",
+        "medium": "중단발",
+        "long": "롱",
+    }
+    return ", ".join(mapping.get(tag, tag) for tag in length_tags)
+
+
+def _serialize_frontend_style(
+    *,
+    style_id: int,
+    match_score: float | None = None,
+    description_override: str | None = None,
+    analysis=None,
+) -> dict:
+    style_data = _style_snapshot(style_id)
+    profile = _style_catalog_profile(style_id)
+    face_ratio_data = {
+        "golden": (
+            f"{analysis.golden_ratio_score:.2f}"
+            if analysis is not None and analysis.golden_ratio_score is not None
+            else None
+        ),
+        "forehead": (", ".join(profile.ratio_modes) if profile else None),
+        "jaw": (", ".join(profile.vibe_tags) if profile else None),
+        "suitableFaces": list(profile.face_shapes) if profile else [],
+    }
+    return {
+        "id": style_id,
+        "hairstyleId": style_id,
+        "universalName": profile.fallback_name if profile else style_data["style_name"],
+        "koreanName": style_data["style_name"],
+        "keywords": style_data["keywords"],
+        "matchRate": int(round(match_score or 0)),
+        "description": description_override or style_data["description"],
+        "faceRatioData": face_ratio_data,
+        "priceRange": _budget_tags_to_price_range(profile.budget_tags if profile else None),
+        "length": _style_tags_to_length(profile.length_tags if profile else None),
+        "gender": "unisex",
+        "imageUrl": style_data["image_url"],
+        "image_url": style_data["image_url"],
+    }
+
+
 def _serialize_recommendation(row: FormerRecommendation) -> dict:
     return serialize_recommendation_row(row)
 
@@ -169,11 +245,19 @@ def _serialize_admin_profile(admin: AdminAccount) -> dict:
     )
     return {
         "admin_id": admin.id,
+        "id": admin.id,
         "name": admin.name,
+        "display_name": admin.name,
+        "displayName": admin.name,
         "store_name": admin.store_name,
+        "storeName": admin.store_name,
         "role": admin.role,
         "phone": admin.phone,
         "business_number": formatted_business_number,
+        "businessNumber": formatted_business_number,
+        "business_verification_status": admin.business_verification_status,
+        "businessVerificationStatus": admin.business_verification_status,
+        "business_verification_snapshot": admin.business_verification_snapshot or {},
         "consent_snapshot": admin.consent_snapshot or {},
         "consented_at": admin.consented_at,
         "is_active": admin.is_active,
@@ -209,8 +293,6 @@ def _scoped_client_queryset(*, admin: AdminAccount | None = None):
         return Client.objects.all()
 
     client_ids = _admin_client_ids(admin)
-    if not client_ids:
-        return Client.objects.all()
     return Client.objects.filter(id__in=client_ids)
 
 
@@ -218,15 +300,254 @@ def _scoped_consultation_queryset(*, admin: AdminAccount | None = None):
     if admin is None:
         return ConsultationRequest.objects.all()
 
-    client_ids = _admin_client_ids(admin)
-    if not client_ids:
-        return ConsultationRequest.objects.all()
     return ConsultationRequest.objects.filter(admin=admin)
+
+
+def _is_new_client(client: Client) -> bool:
+    return timezone.now() - client.created_at <= timezone.timedelta(days=30)
+
+
+def _format_visit_date(value) -> str | None:
+    if value is None:
+        return None
+    return timezone.localtime(value).date().isoformat()
+
+
+def _latest_client_activity_at(*, client: Client, admin: AdminAccount | None = None):
+    consultation_queryset = client.consultations
+    if admin is not None:
+        consultation_queryset = consultation_queryset.filter(admin=admin)
+
+    timestamps = [
+        consultation_queryset.order_by("-created_at").values_list("created_at", flat=True).first(),
+        client.captures.order_by("-created_at").values_list("created_at", flat=True).first(),
+        client.style_selections.order_by("-created_at").values_list("created_at", flat=True).first(),
+    ]
+    timestamps = [value for value in timestamps if value is not None]
+    if not timestamps:
+        return client.created_at
+    return max(timestamps)
+
+
+def _latest_note(*, client: Client, admin: AdminAccount | None = None):
+    queryset = ClientSessionNote.objects.filter(client=client).select_related("admin")
+    if admin is not None:
+        queryset = queryset.filter(admin=admin)
+    return queryset.order_by("-created_at").first()
+
+
+def _resolve_today_style(*, client: Client, latest_consultation=None):
+    latest_selection = client.style_selections.order_by("-created_at").first()
+    if latest_selection:
+        style_snapshot = _style_snapshot(latest_selection.style_id)
+        return {
+            "style_id": latest_selection.style_id,
+            "style_name": style_snapshot["style_name"],
+        }
+
+    if latest_consultation and latest_consultation.selected_style_id:
+        style_snapshot = _style_snapshot(latest_consultation.selected_style_id)
+        return {
+            "style_id": latest_consultation.selected_style_id,
+            "style_name": style_snapshot["style_name"],
+        }
+
+    if latest_consultation and latest_consultation.selected_recommendation:
+        row = latest_consultation.selected_recommendation
+        return {
+            "style_id": row.style_id_snapshot,
+            "style_name": row.style_name_snapshot,
+        }
+
+    return {"style_id": None, "style_name": None}
+
+
+def _latest_confirmed_selection(*, client: Client):
+    return (
+        client.style_selections.filter(is_sent_to_admin=True)
+        .order_by("-created_at")
+        .first()
+    )
+
+
+def _latest_generated_batch_row(*, client: Client):
+    return (
+        FormerRecommendation.objects.filter(client=client, source__in=["generated", "survey_only"])
+        .order_by("-created_at")
+        .first()
+    )
+
+
+def _build_client_interaction_state(*, client: Client, admin: AdminAccount | None = None, latest_consultation=None) -> dict:
+    if latest_consultation is None:
+        consultation_queryset = client.consultations
+        if admin is not None:
+            consultation_queryset = consultation_queryset.filter(admin=admin)
+        latest_consultation = consultation_queryset.order_by("-created_at").first()
+
+    latest_capture_attempt = get_latest_capture_attempt(client)
+    latest_survey = get_latest_survey(client)
+    latest_batch = _latest_generated_batch_row(client=client)
+    latest_selection = _latest_confirmed_selection(client=client)
+
+    current_step = "client_input"
+    interaction_status = "awaiting_client_input"
+    interaction_status_label = "입력 대기"
+    capture_required_for_full_result = False
+
+    if latest_consultation and latest_consultation.is_active:
+        current_step = "consultation"
+        if latest_consultation.status == "IN_PROGRESS":
+            interaction_status = "consultation_in_progress"
+            interaction_status_label = "상담 진행 중"
+        else:
+            interaction_status = "confirmed_waiting_admin"
+            interaction_status_label = "관리자 상담 대기"
+    elif latest_consultation and latest_consultation.status == "CANCELLED":
+        current_step = "client_input"
+        interaction_status = "selection_cancelled"
+        interaction_status_label = "스타일 취소 후 입력 단계 복귀"
+    elif latest_consultation and latest_consultation.status == "CLOSED":
+        current_step = "completed"
+        interaction_status = "consultation_closed"
+        interaction_status_label = "상담 종료"
+    elif latest_selection is not None:
+        current_step = "consultation"
+        interaction_status = "style_confirmed"
+        interaction_status_label = "스타일 확정"
+    elif latest_capture_attempt is not None and latest_capture_attempt.status in {"NEEDS_RETAKE", "FAILED"}:
+        current_step = "capture"
+        interaction_status = "needs_retake"
+        interaction_status_label = "재촬영 필요"
+    elif latest_batch is not None:
+        current_step = "recommendation"
+        if latest_batch.source == "survey_only":
+            interaction_status = "survey_recommendations_ready"
+            interaction_status_label = "설문 기반 추천 준비"
+            capture_required_for_full_result = True
+        else:
+            interaction_status = "recommendations_ready"
+            interaction_status_label = "추천 결과 확인 가능"
+    elif latest_capture_attempt is not None and latest_capture_attempt.status == "DONE":
+        current_step = "capture"
+        interaction_status = "capture_complete"
+        interaction_status_label = "촬영 완료"
+    elif latest_survey is not None:
+        current_step = "survey"
+        interaction_status = "survey_complete"
+        interaction_status_label = "설문 완료"
+
+    return {
+        "current_step": current_step,
+        "currentStep": current_step,
+        "interaction_status": interaction_status,
+        "interactionStatus": interaction_status,
+        "interaction_status_label": interaction_status_label,
+        "interactionStatusLabel": interaction_status_label,
+        "consultation_status": (latest_consultation.status if latest_consultation else None),
+        "consultationStatus": (latest_consultation.status if latest_consultation else None),
+        "capture_required_for_full_result": capture_required_for_full_result,
+        "captureRequiredForFullResult": capture_required_for_full_result,
+    }
+
+
+def _build_admin_survey_results(*, survey, survey_snapshot: dict | None = None) -> dict:
+    survey_snapshot = survey_snapshot or {}
+    preferences = survey_snapshot.get("preferences")
+    if not isinstance(preferences, list):
+        preferences = []
+    return {
+        "preferences": preferences,
+        "length": survey.target_length if survey else survey_snapshot.get("target_length"),
+        "budget": survey.budget_range if survey else survey_snapshot.get("budget_range"),
+        "occasion": survey_snapshot.get("occasion"),
+        "atmosphere": survey.target_vibe if survey else survey_snapshot.get("target_vibe"),
+    }
+
+
+def _serialize_recommendation_history_item(selection: StyleSelection, *, admin: AdminAccount | None = None) -> dict:
+    style_snapshot = _style_snapshot(selection.style_id)
+    consultation_queryset = ConsultationRequest.objects.filter(client=selection.client, selected_style_id=selection.style_id).select_related("admin")
+    if admin is not None:
+        consultation_queryset = consultation_queryset.filter(admin=admin)
+    latest_consultation = consultation_queryset.order_by("-created_at").first()
+    note_queryset = ClientSessionNote.objects.filter(client=selection.client)
+    if latest_consultation:
+        note_queryset = note_queryset.filter(consultation=latest_consultation)
+    if admin is not None:
+        note_queryset = note_queryset.filter(admin=admin)
+    latest_note = note_queryset.order_by("-created_at").first()
+    stylist_name = None
+    if latest_consultation and latest_consultation.admin:
+        stylist_name = latest_consultation.admin.name
+    elif latest_note and latest_note.admin:
+        stylist_name = latest_note.admin.name
+
+    return {
+        "date": _format_visit_date(selection.created_at),
+        "styleName": style_snapshot["style_name"],
+        "stylist": stylist_name or "MirrAI Admin",
+        "result": "확정" if selection.is_sent_to_admin else "추천",
+        "note": latest_note.content if latest_note else None,
+    }
+
+
+def _serialize_admin_client_card(*, client: Client, admin: AdminAccount | None = None) -> dict:
+    latest_analysis = get_latest_analysis(client)
+    latest_survey = get_latest_survey(client)
+    consultation_queryset = client.consultations
+    if admin is not None:
+        consultation_queryset = consultation_queryset.filter(admin=admin)
+    latest_consultation = consultation_queryset.order_by("-created_at").first()
+    latest_note = _latest_note(client=client, admin=admin)
+    today_style = _resolve_today_style(client=client, latest_consultation=latest_consultation)
+    age_fields = _client_age_fields(client)
+    interaction_state = _build_client_interaction_state(
+        client=client,
+        admin=admin,
+        latest_consultation=latest_consultation,
+    )
+    return {
+        "client_id": client.id,
+        "id": client.id,
+        "name": client.name,
+        "phone": client.phone,
+        "gender": client.gender,
+        **age_fields,
+        "is_new_client": _is_new_client(client),
+        "isNew": _is_new_client(client),
+        "face_shape": latest_analysis.face_shape if latest_analysis else None,
+        "faceShape": latest_analysis.face_shape if latest_analysis else None,
+        "golden_ratio": latest_analysis.golden_ratio_score if latest_analysis else None,
+        "goldenRatio": latest_analysis.golden_ratio_score if latest_analysis else None,
+        "last_visit": _format_visit_date(_latest_client_activity_at(client=client, admin=admin)),
+        "lastVisit": _format_visit_date(_latest_client_activity_at(client=client, admin=admin)),
+        "today_recommendation_id": today_style["style_id"],
+        "todayRecommendationId": today_style["style_id"],
+        "today_recommendation_name": today_style["style_name"],
+        "todayRecommendationName": today_style["style_name"],
+        "designer_note": latest_note.content if latest_note else "",
+        "designerNote": latest_note.content if latest_note else "",
+        "survey_results": _build_admin_survey_results(
+            survey=latest_survey,
+            survey_snapshot=(latest_consultation.survey_snapshot if latest_consultation else None),
+        ),
+        "surveyResults": _build_admin_survey_results(
+            survey=latest_survey,
+            survey_snapshot=(latest_consultation.survey_snapshot if latest_consultation else None),
+        ),
+        "created_at": client.created_at,
+        "has_active_consultation": consultation_queryset.filter(is_active=True).exists(),
+        "hasActiveConsultation": consultation_queryset.filter(is_active=True).exists(),
+        **interaction_state,
+    }
 
 
 def get_admin_profile(*, admin: AdminAccount) -> dict:
     return {
         "status": "success",
+        "is_authenticated": True,
+        "next_action": "admin_dashboard",
         "admin": _serialize_admin_profile(admin),
     }
 
@@ -247,6 +568,9 @@ def register_admin(*, payload: dict) -> dict:
         raise ValueError("The business registration number is not valid.")
     if AdminAccount.objects.filter(Q(business_number__in=_business_number_variants(business_number))).exists():
         raise ValueError("This business registration number is already registered.")
+    verification_snapshot = verify_business_number(business_number=business_number)
+    if verification_snapshot["verification_status"] == "rejected":
+        raise ValueError("The business registration number failed external verification.")
 
     admin = AdminAccount.objects.create(
         name=payload["name"],
@@ -255,6 +579,8 @@ def register_admin(*, payload: dict) -> dict:
         phone=phone,
         business_number=business_number,
         password_hash=make_password(payload["password"]),
+        business_verification_status=verification_snapshot["verification_status"],
+        business_verification_snapshot=verification_snapshot,
         consent_snapshot=consent_snapshot,
         consented_at=timezone.now(),
     )
@@ -308,8 +634,8 @@ def get_admin_dashboard_summary(*, admin: AdminAccount | None = None) -> dict:
     start = timezone.localtime().replace(hour=0, minute=0, second=0, microsecond=0)
     styles_by_id = ensure_catalog_styles()
     admin_client_ids = _admin_client_ids(admin)
-    style_selection_queryset = StyleSelection.objects.filter(created_at__gte=start)
-    if admin_client_ids:
+    style_selection_queryset = StyleSelection.objects.filter(created_at__gte=start, is_sent_to_admin=True)
+    if admin is not None:
         style_selection_queryset = style_selection_queryset.filter(client_id__in=admin_client_ids)
     top_rows = (
         style_selection_queryset
@@ -340,8 +666,25 @@ def get_admin_dashboard_summary(*, admin: AdminAccount | None = None) -> dict:
             "status": row.status,
             "selected_style_name": row.selected_style.name if row.selected_style else None,
             "created_at": row.created_at,
+            **_build_client_interaction_state(client=row.client, admin=admin, latest_consultation=row),
         }
         for row in active_consultations[:5]
+    ]
+    closed_consultations = _scoped_consultation_queryset(admin=admin).filter(
+        status="CLOSED",
+        closed_at__gte=start,
+    ).count()
+    today_summary = {
+        "total_visits": len(_today_client_ids(admin=admin)),
+        "new_clients": _scoped_client_queryset(admin=admin).filter(created_at__gte=start).count(),
+        "recommendations_completed": style_selection_queryset.count(),
+        "consultations_closed": closed_consultations,
+    }
+    summary_cards = [
+        {"key": "total_visits", "label": "오늘 방문 고객", "value": today_summary["total_visits"]},
+        {"key": "new_clients", "label": "신규 등록", "value": today_summary["new_clients"]},
+        {"key": "recommendations_completed", "label": "추천 완료", "value": today_summary["recommendations_completed"]},
+        {"key": "consultations_closed", "label": "상담 종료", "value": today_summary["consultations_closed"]},
     ]
     return {
         "status": "ready",
@@ -352,8 +695,14 @@ def get_admin_dashboard_summary(*, admin: AdminAccount | None = None) -> dict:
             "pending_consultations": sum(1 for row in active_consultations if not row.is_read),
             "confirmed_styles": style_selection_queryset.count(),
         },
+        "today_summary": today_summary,
+        "todaySummary": today_summary,
+        "summary_cards": summary_cards,
+        "summaryCards": summary_cards,
         "top_styles_today": top_styles,
+        "topStylesToday": top_styles,
         "active_clients_preview": active_preview,
+        "activeClientsPreview": active_preview,
     }
 
 
@@ -377,6 +726,7 @@ def get_active_client_sessions(*, admin: AdminAccount | None = None) -> dict:
                 "selected_style_name": row.selected_style.name if row.selected_style else None,
                 "recommendation_count": recommendation_count,
                 "last_activity_at": row.created_at,
+                **_build_client_interaction_state(client=row.client, admin=admin, latest_consultation=row),
             }
         )
     return {"status": "ready", "items": items}
@@ -389,41 +739,69 @@ def get_all_clients(*, query: str = "", admin: AdminAccount | None = None) -> di
 
     items = []
     for client in queryset[:100]:
-        latest_consult = client.consultations.order_by("-created_at").first()
-        items.append(
+        card = _serialize_admin_client_card(client=client, admin=admin)
+        latest_consult_queryset = client.consultations
+        if admin is not None:
+            latest_consult_queryset = latest_consult_queryset.filter(admin=admin)
+        latest_consult = latest_consult_queryset.order_by("-created_at").first()
+        card.update(
             {
-                "client_id": client.id,
-                "name": client.name,
-                "gender": client.gender,
-                "phone": client.phone,
-                **_client_age_fields(client),
-                "created_at": client.created_at,
                 "last_consulted_at": latest_consult.created_at if latest_consult else None,
-                "has_active_consultation": client.consultations.filter(is_active=True).exists(),
             }
         )
-    return {"status": "ready", "items": items}
+        items.append(card)
+
+    dashboard_summary = get_admin_dashboard_summary(admin=admin)
+    return {
+        "status": "ready",
+        "query": query,
+        "total_count": queryset.count(),
+        "items": items,
+        "summary": dashboard_summary["today_summary"],
+        "top_styles": dashboard_summary["top_styles_today"][:3],
+    }
 
 
 def get_client_detail(*, client: Client, admin: AdminAccount | None = None) -> dict:
     scoped_client_ids = _admin_client_ids(admin)
-    if scoped_client_ids and client.id not in scoped_client_ids:
+    if admin is not None and client.id not in scoped_client_ids:
         raise ValueError("Client is outside the current admin scope.")
 
     latest_survey = get_latest_survey(client)
     latest_analysis = get_latest_analysis(client)
     consultation_queryset = client.consultations
-    if admin is not None and scoped_client_ids:
+    if admin is not None:
         consultation_queryset = consultation_queryset.filter(admin=admin)
     latest_consultation = consultation_queryset.order_by("-created_at").first()
     notes_queryset = ClientSessionNote.objects.filter(client=client).select_related("admin", "consultation")
-    if admin is not None and scoped_client_ids:
+    if admin is not None:
         notes_queryset = notes_queryset.filter(admin=admin)
     notes = notes_queryset.order_by("-created_at")[:20]
     capture_history = client.captures.order_by("-created_at")[:20]
     analysis_history = client.face_analyses.order_by("-created_at")[:20]
     selection_history = client.style_selections.order_by("-created_at")[:20]
     chosen_recommendations = FormerRecommendation.objects.filter(client=client, is_chosen=True).order_by("-chosen_at", "-created_at")[:20]
+    latest_note = notes.first()
+    today_style = _resolve_today_style(client=client, latest_consultation=latest_consultation)
+    recommendation_history = [
+        _serialize_recommendation_history_item(selection, admin=admin)
+        for selection in selection_history[:10]
+    ]
+    client_summary = {
+        **_serialize_admin_client_card(client=client, admin=admin),
+        "total_sessions": consultation_queryset.count(),
+        "totalSessions": consultation_queryset.count(),
+        "last_visit": _format_visit_date(_latest_client_activity_at(client=client, admin=admin)),
+        "lastVisit": _format_visit_date(_latest_client_activity_at(client=client, admin=admin)),
+        "today_recommendation_id": today_style["style_id"],
+        "todayRecommendationId": today_style["style_id"],
+        "today_recommendation_name": today_style["style_name"],
+        "todayRecommendationName": today_style["style_name"],
+        "designer_note": latest_note.content if latest_note else "",
+        "designerNote": latest_note.content if latest_note else "",
+        "recommendation_history": recommendation_history,
+        "recommendationHistory": recommendation_history,
+    }
 
     return {
         "status": "ready",
@@ -435,12 +813,19 @@ def get_client_detail(*, client: Client, admin: AdminAccount | None = None) -> d
             **_client_age_fields(client),
             "created_at": client.created_at,
         },
+        "customer": client_summary,
+        "client_summary": client_summary,
+        "clientSummary": client_summary,
         "latest_survey": _serialize_survey(latest_survey),
         "latest_analysis": _serialize_analysis(latest_analysis),
         "capture_history": [_serialize_capture(record) for record in capture_history],
         "analysis_history": [_serialize_analysis(analysis) for analysis in analysis_history],
         "style_selection_history": [_serialize_style_selection(selection) for selection in selection_history],
         "chosen_recommendation_history": [_serialize_recommendation(row) for row in chosen_recommendations],
+        "recommendation_history": recommendation_history,
+        "recommendationHistory": recommendation_history,
+        "designer_note": latest_note.content if latest_note else "",
+        "designerNote": latest_note.content if latest_note else "",
         "active_consultation": (
             {
                 "consultation_id": latest_consultation.id,
@@ -450,6 +835,7 @@ def get_client_detail(*, client: Client, admin: AdminAccount | None = None) -> d
                 "source": latest_consultation.source,
                 "created_at": latest_consultation.created_at,
                 "closed_at": latest_consultation.closed_at,
+                **_build_client_interaction_state(client=client, admin=admin, latest_consultation=latest_consultation),
             }
             if latest_consultation
             else None
@@ -470,34 +856,112 @@ def get_client_detail(*, client: Client, admin: AdminAccount | None = None) -> d
 
 def get_client_recommendation_report(*, client: Client, admin: AdminAccount | None = None) -> dict:
     scoped_client_ids = _admin_client_ids(admin)
-    if scoped_client_ids and client.id not in scoped_client_ids:
+    if admin is not None and client.id not in scoped_client_ids:
         raise ValueError("Client is outside the current admin scope.")
 
     latest_analysis = get_latest_analysis(client)
     latest_survey = get_latest_survey(client)
-    recommendation_queryset = FormerRecommendation.objects.filter(client=client, source="generated")
-    if admin is not None and scoped_client_ids:
+    recommendation_queryset = FormerRecommendation.objects.filter(client=client, source__in=["generated", "survey_only"])
+    if admin is not None:
         recommendation_queryset = recommendation_queryset.filter(client_id__in=scoped_client_ids)
     latest_generated = recommendation_queryset.order_by("-created_at").first()
     batch_rows = []
     if latest_generated:
         batch_rows = list(FormerRecommendation.objects.filter(client=client, batch_id=latest_generated.batch_id).order_by("rank", "id"))
     final_selected = FormerRecommendation.objects.filter(client=client, is_chosen=True).order_by("-chosen_at", "-created_at").first()
+    consultation_queryset = client.consultations
+    if admin is not None:
+        consultation_queryset = consultation_queryset.filter(admin=admin)
+    latest_consultation = consultation_queryset.order_by("-created_at").first()
+    recommendation_items = [_serialize_recommendation(row) for row in batch_rows]
+    frontend_styles = [
+        _serialize_frontend_style(
+            style_id=row.style_id_snapshot,
+            match_score=row.match_score,
+            description_override=(row.llm_explanation or row.style_description_snapshot),
+            analysis=latest_analysis,
+        )
+        for row in batch_rows
+    ]
+    primary_batch_row = batch_rows[0] if batch_rows else latest_generated
+    today_style_id = None
+    today_style_source = None
+    if final_selected:
+        today_style_id = final_selected.style_id_snapshot
+        today_style_source = "confirmed_selection"
+    elif primary_batch_row:
+        today_style_id = primary_batch_row.style_id_snapshot
+        today_style_source = "batch_rank_1"
+    today_style = (
+        _serialize_frontend_style(
+            style_id=today_style_id,
+            match_score=(final_selected.match_score if final_selected else primary_batch_row.match_score if primary_batch_row else None),
+            description_override=(final_selected.llm_explanation if final_selected else primary_batch_row.llm_explanation if primary_batch_row else None),
+            analysis=latest_analysis,
+        )
+        if today_style_id is not None
+        else None
+    )
+    if today_style is not None:
+        today_style["sourceRule"] = today_style_source
+        today_style["source_rule"] = today_style_source
+        today_style["rank"] = 1 if today_style_source == "batch_rank_1" else None
+    survey_results = _build_admin_survey_results(
+        survey=latest_survey,
+        survey_snapshot=(latest_consultation.survey_snapshot if latest_consultation else None),
+    )
+    ai_profile = {
+        "faceShape": latest_analysis.face_shape if latest_analysis else None,
+        "face_shape": latest_analysis.face_shape if latest_analysis else None,
+        "goldenRatio": latest_analysis.golden_ratio_score if latest_analysis else None,
+        "golden_ratio": latest_analysis.golden_ratio_score if latest_analysis else None,
+    }
+    client_summary = {
+        **_serialize_admin_client_card(client=client, admin=admin),
+        "surveyResults": survey_results,
+        "todayRecommendationId": today_style["id"] if today_style else None,
+        "todayRecommendationName": today_style["koreanName"] if today_style else None,
+    }
+    recommendation_mode = latest_generated.source if latest_generated else None
+    capture_required_for_full_result = bool(latest_generated and latest_generated.source == "survey_only")
 
     return {
-        "status": "ready",
+        "status": ("ready" if recommendation_items else "empty"),
         "client": {
             "client_id": client.id,
             "name": client.name,
             "phone": client.phone,
             **_client_age_fields(client),
         },
+        "customer": client_summary,
+        "client_summary": client_summary,
+        "clientSummary": client_summary,
         "latest_survey": _serialize_survey(latest_survey),
+        "surveyResults": survey_results,
         "latest_analysis": _serialize_analysis(latest_analysis),
+        "ai_profile": ai_profile,
+        "aiProfile": ai_profile,
         "final_selected_style": (_serialize_recommendation(final_selected) if final_selected else None),
+        "today_style": today_style,
+        "todayStyle": today_style,
+        "today_style_source": today_style_source,
+        "todayStyleSource": today_style_source,
+        "recommended_styles": frontend_styles,
+        "recommendedStyles": frontend_styles,
+        "hairstyles": frontend_styles,
+        "recommended_styles_purpose": "frontend_style_cards",
+        "recommendedStylesPurpose": "frontend_style_cards",
+        "items": recommendation_items,
+        "items_purpose": "raw_recommendation_rows",
+        "itemsPurpose": "raw_recommendation_rows",
+        "recommendation_mode": recommendation_mode,
+        "recommendationMode": recommendation_mode,
+        "capture_required_for_full_result": capture_required_for_full_result,
+        "captureRequiredForFullResult": capture_required_for_full_result,
+        "has_recommendations": bool(recommendation_items),
         "latest_generated_batch": {
             "batch_id": str(latest_generated.batch_id) if latest_generated else None,
-            "items": [_serialize_recommendation(row) for row in batch_rows],
+            "items": recommendation_items,
         },
     }
 
@@ -506,6 +970,8 @@ def create_client_note(*, client: Client, consultation_id: int, content: str, ad
     consultation = ConsultationRequest.objects.filter(id=consultation_id, client=client).first()
     if not consultation:
         raise ValueError("The consultation session could not be found.")
+    if admin is not None and consultation.admin_id not in (None, admin.id):
+        raise ValueError("The consultation session is outside the current admin scope.")
 
     if admin is not None and consultation.admin_id is None:
         consultation.admin = admin
@@ -532,6 +998,8 @@ def close_consultation_session(*, consultation_id: int, admin: AdminAccount | No
     consultation = ConsultationRequest.objects.filter(id=consultation_id).select_related("client").first()
     if not consultation:
         raise ValueError("The consultation session could not be found.")
+    if admin is not None and consultation.admin_id not in (None, admin.id):
+        raise ValueError("The consultation session is outside the current admin scope.")
 
     if admin is not None and consultation.admin_id is None:
         consultation.admin = admin
@@ -588,9 +1056,13 @@ def _selection_matches_snapshot(selection: StyleSelection, filters: dict) -> boo
 def get_admin_trend_report(*, days: int = 7, filters: dict | None = None, admin: AdminAccount | None = None) -> dict:
     filters = filters or {}
     cutoff = timezone.now() - timezone.timedelta(days=days)
-    selections_queryset = StyleSelection.objects.filter(created_at__gte=cutoff).select_related("client").order_by("-created_at")
+    selections_queryset = (
+        StyleSelection.objects.filter(created_at__gte=cutoff, is_sent_to_admin=True)
+        .select_related("client")
+        .order_by("-created_at")
+    )
     scoped_client_ids = _admin_client_ids(admin)
-    if admin is not None and scoped_client_ids:
+    if admin is not None:
         selections_queryset = selections_queryset.filter(client_id__in=scoped_client_ids)
     selections = list(selections_queryset)
     filtered = [row for row in selections if _selection_matches_snapshot(row, filters)]
@@ -599,14 +1071,22 @@ def get_admin_trend_report(*, days: int = 7, filters: dict | None = None, admin:
     ranking = []
     for rank, (style_id, count) in enumerate(counter.most_common(10), start=1):
         style_data = _style_snapshot(style_id)
+        profile = next((item for item in STYLE_CATALOG if item.style_id == style_id), None)
         ranking.append(
             {
+                "id": style_id,
                 "rank": rank,
                 "style_id": style_id,
+                "hairstyleId": style_id,
                 "style_name": style_data["style_name"],
+                "koreanName": style_data["style_name"],
+                "universalName": profile.fallback_name if profile else style_data["style_name"],
                 "image_url": style_data["image_url"],
+                "imageUrl": style_data["image_url"],
                 "selection_count": count,
+                "count": count,
                 "keywords": style_data["keywords"],
+                "description": style_data["description"],
             }
         )
 
@@ -629,6 +1109,25 @@ def get_admin_trend_report(*, days: int = 7, filters: dict | None = None, admin:
         if profile.get("age_group"):
             age_group_counter[profile["age_group"]] += 1
     unique_clients = len({row.client_id for row in filtered})
+    hairstyles = [
+        {
+            "id": item["style_id"],
+            "hairstyleId": item["style_id"],
+            "koreanName": item["koreanName"],
+            "universalName": item["universalName"],
+            "keywords": item["keywords"],
+            "description": item["description"],
+            "imageUrl": item["imageUrl"],
+        }
+        for item in ranking
+    ]
+    chart_data = [
+        {
+            "label": item["koreanName"],
+            "value": item["count"],
+        }
+        for item in ranking
+    ]
     return {
         "status": "ready",
         "days": days,
@@ -639,6 +1138,11 @@ def get_admin_trend_report(*, days: int = 7, filters: dict | None = None, admin:
             "active_consultations": len(_latest_active_consultations(admin=admin)),
         },
         "ranking": ranking,
+        "trend_report": ranking,
+        "trendReport": ranking,
+        "hairstyles": hairstyles,
+        "chart_data": chart_data,
+        "chartData": chart_data,
         "distribution": distribution,
         "age_decade_distribution": [
             {"age_decade": key, "selection_count": count}
@@ -653,11 +1157,16 @@ def get_admin_trend_report(*, days: int = 7, filters: dict | None = None, admin:
 
 def get_style_report(*, style_id: int, days: int = 7, admin: AdminAccount | None = None) -> dict:
     style_data = _style_snapshot(style_id)
+    style_profile = _style_catalog_profile(style_id)
     cutoff = timezone.now() - timezone.timedelta(days=days)
-    recent_queryset = StyleSelection.objects.filter(style_id=style_id, created_at__gte=cutoff)
+    recent_queryset = StyleSelection.objects.filter(
+        style_id=style_id,
+        created_at__gte=cutoff,
+        is_sent_to_admin=True,
+    )
     chosen_queryset = FormerRecommendation.objects.filter(style_id_snapshot=style_id, is_chosen=True)
     scoped_client_ids = _admin_client_ids(admin)
-    if admin is not None and scoped_client_ids:
+    if admin is not None:
         recent_queryset = recent_queryset.filter(client_id__in=scoped_client_ids)
         chosen_queryset = chosen_queryset.filter(client_id__in=scoped_client_ids)
     recent_count = recent_queryset.count()
@@ -667,13 +1176,15 @@ def get_style_report(*, style_id: int, days: int = 7, admin: AdminAccount | None
     target_profile = next((item for item in STYLE_CATALOG if item.style_id == style_id), None)
     if target_profile:
         scored = []
-        for profile in STYLE_CATALOG:
-            if profile.style_id == style_id:
+        for related_profile in STYLE_CATALOG:
+            if related_profile.style_id == style_id:
                 continue
-            score = len(set(target_profile.keywords) & set(profile.keywords))
-            if set(target_profile.vibe_tags) & set(profile.vibe_tags):
+            score = len(set(target_profile.keywords) & set(related_profile.keywords))
+            if set(target_profile.face_shapes) & set(related_profile.face_shapes):
                 score += 1
-            scored.append((score, profile.style_id))
+            if set(target_profile.vibe_tags) & set(related_profile.vibe_tags):
+                score += 1
+            scored.append((score, related_profile.style_id))
         for _, related_style_id in sorted(scored, key=lambda item: (-item[0], item[1]))[:5]:
             related.append(_style_snapshot(related_style_id))
 
@@ -684,6 +1195,21 @@ def get_style_report(*, style_id: int, days: int = 7, admin: AdminAccount | None
             "recent_selection_count": recent_count,
             "chosen_count": chosen_count,
         },
+        "hairstyle": {
+            **_serialize_frontend_style(style_id=style_id, analysis=None),
+            "recentSelectionCount": recent_count,
+            "chosenCount": chosen_count,
+            "faceRatioData": {
+                "golden": None,
+                "forehead": (", ".join(style_profile.ratio_modes) if style_profile else None),
+                "jaw": (", ".join(style_profile.vibe_tags) if style_profile else None),
+                "suitableFaces": list(style_profile.face_shapes) if style_profile else [],
+            },
+        },
         "related_styles": related,
+        "relatedHairstyles": [
+            _serialize_frontend_style(style_id=item["style_id"], analysis=None)
+            for item in related
+        ],
     }
 

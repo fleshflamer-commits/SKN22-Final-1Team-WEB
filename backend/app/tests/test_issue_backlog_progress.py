@@ -12,7 +12,7 @@ from rest_framework.test import APITestCase
 
 from app.api.v1.admin_auth import build_admin_token
 from app.api.v1.services_django import persist_generated_batch, run_mirrai_analysis_pipeline
-from app.models_django import AdminAccount, CaptureRecord, ConsultationRequest, Client, FaceAnalysis, StyleSelection, Survey
+from app.models_django import AdminAccount, CaptureRecord, ClientSessionNote, ConsultationRequest, Client, FaceAnalysis, StyleSelection, Survey
 
 
 def build_valid_business_number(prefix: str = "123456789") -> str:
@@ -98,6 +98,8 @@ class BackendIssueProgressTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         admin = AdminAccount.objects.get(id=response.data["admin_id"])
         self.assertEqual(admin.business_number, valid_business_number)
+        self.assertEqual(admin.business_verification_status, "checksum_only")
+        self.assertEqual(admin.business_verification_snapshot["source"], "local_checksum")
         self.assertTrue(admin.consent_snapshot["agree_terms"])
         self.assertIsNotNone(admin.consented_at)
         self.assertIn("access_token", response.data)
@@ -176,7 +178,13 @@ class BackendIssueProgressTests(APITestCase):
 
     @override_settings(MIRRAI_PERSIST_CAPTURE_IMAGES=True)
     def test_capture_upload_persists_landmarks_and_deidentified_asset(self):
-        client = Client.objects.create(name="Face Tester", phone="01055556666", gender="F")
+        client = Client.objects.create(
+            name="Face Tester",
+            phone="01055556666",
+            gender="F",
+            image_storage_consent=True,
+            image_storage_consented_at=timezone.now(),
+        )
         buffer = io.BytesIO()
         Image.new("RGB", (640, 640), "gray").save(buffer, format="PNG")
         upload = SimpleUploadedFile("face.png", buffer.getvalue(), content_type="image/png")
@@ -407,6 +415,16 @@ class BackendIssueProgressTests(APITestCase):
             match_score=selected_row.match_score,
             is_sent_to_admin=True,
         )
+        ConsultationRequest.objects.create(
+            client=client,
+            admin=admin,
+            selected_style=selected_row.style,
+            selected_recommendation=selected_row,
+            source="current_recommendations",
+            status="PENDING",
+            is_active=True,
+            is_read=False,
+        )
 
         recommendation_response = self.client.get(f"/api/v1/analysis/recommendations/?client_id={client.id}")
         self.assertEqual(recommendation_response.status_code, status.HTTP_200_OK)
@@ -504,4 +522,508 @@ class BackendIssueProgressTests(APITestCase):
         )
         self.assertEqual(admin_response.status_code, status.HTTP_200_OK)
         self.assertGreaterEqual(admin_response.data["today_metrics"]["active_clients"], 1)
+
+    def test_confirm_and_cancel_sync_admin_dashboard_and_client_contract(self):
+        client = Client.objects.create(name="Action Contract Tester", phone="01028284444", gender="F")
+        admin = AdminAccount.objects.create(
+            name="Manager Action",
+            store_name="MirrAI Action",
+            role="owner",
+            phone="01098981111",
+            business_number=build_valid_business_number("456789013"),
+            password_hash="hashed",
+            consent_snapshot={
+                "agree_terms": True,
+                "agree_privacy": True,
+                "agree_third_party_sharing": True,
+            },
+        )
+        survey = Survey.objects.create(
+            client=client,
+            target_length="medium",
+            target_vibe="soft",
+            scalp_type="normal",
+            hair_colour="brown",
+            budget_range="10-15",
+            preference_vector=[1.0] * 20,
+        )
+        capture = CaptureRecord.objects.create(
+            client=client,
+            original_path=None,
+            processed_path=None,
+            filename=None,
+            status="DONE",
+            face_count=1,
+            privacy_snapshot={"storage_policy": "vector_only"},
+        )
+        analysis = FaceAnalysis.objects.create(
+            client=client,
+            face_shape="Oval",
+            golden_ratio_score=0.88,
+            image_url=None,
+            landmark_snapshot={"version": "coarse-v1"},
+        )
+        _, rows = persist_generated_batch(
+            client=client,
+            capture_record=capture,
+            survey=survey,
+            analysis=analysis,
+        )
+        token = build_admin_token(admin=admin)
+
+        confirm_response = self.client.post(
+            "/api/v1/analysis/confirm/",
+            {
+                "client_id": client.id,
+                "recommendation_id": rows[0].id,
+                "admin_id": admin.id,
+                "source": "current_recommendations",
+                "direct_consultation": False,
+            },
+            format="json",
+        )
+
+        self.assertEqual(confirm_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(confirm_response.data["current_step"], "consultation")
+        self.assertEqual(confirm_response.data["interaction_status"], "confirmed_waiting_admin")
+
+        dashboard_after_confirm = self.client.get(
+            "/api/v1/admin/dashboard/",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(dashboard_after_confirm.status_code, status.HTTP_200_OK)
+        self.assertEqual(dashboard_after_confirm.data["todaySummary"]["recommendations_completed"], 1)
+        self.assertEqual(dashboard_after_confirm.data["activeClientsPreview"][0]["currentStep"], "consultation")
+        self.assertEqual(
+            dashboard_after_confirm.data["activeClientsPreview"][0]["interactionStatus"],
+            "confirmed_waiting_admin",
+        )
+
+        clients_after_confirm = self.client.get(
+            "/api/v1/admin/clients/",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(clients_after_confirm.status_code, status.HTTP_200_OK)
+        confirmed_client = clients_after_confirm.data["items"][0]
+        self.assertEqual(confirmed_client["currentStep"], "consultation")
+        self.assertEqual(confirmed_client["interactionStatus"], "confirmed_waiting_admin")
+
+        cancel_response = self.client.post(
+            "/api/v1/analysis/cancel/",
+            {"client_id": client.id, "recommendation_id": rows[0].id},
+            format="json",
+        )
+        self.assertEqual(cancel_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(cancel_response.data["current_step"], "client_input")
+        self.assertEqual(cancel_response.data["interaction_status"], "selection_cancelled")
+
+        selection = StyleSelection.objects.filter(client=client).latest("created_at")
+        self.assertFalse(selection.is_sent_to_admin)
+
+        dashboard_after_cancel = self.client.get(
+            "/api/v1/admin/dashboard/",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(dashboard_after_cancel.status_code, status.HTTP_200_OK)
+        self.assertEqual(dashboard_after_cancel.data["todaySummary"]["recommendations_completed"], 0)
+        self.assertEqual(dashboard_after_cancel.data["topStylesToday"], [])
+        self.assertEqual(dashboard_after_cancel.data["activeClientsPreview"], [])
+
+        clients_after_cancel = self.client.get(
+            "/api/v1/admin/clients/",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(clients_after_cancel.status_code, status.HTTP_200_OK)
+        cancelled_client = clients_after_cancel.data["items"][0]
+        self.assertEqual(cancelled_client["currentStep"], "client_input")
+        self.assertEqual(cancelled_client["interactionStatus"], "selection_cancelled")
+
+        detail_after_cancel = self.client.get(
+            f"/api/v1/admin/clients/detail/?client_id={client.id}",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(detail_after_cancel.status_code, status.HTTP_200_OK)
+        self.assertEqual(detail_after_cancel.data["clientSummary"]["currentStep"], "client_input")
+        self.assertEqual(detail_after_cancel.data["clientSummary"]["interactionStatus"], "selection_cancelled")
+        self.assertEqual(detail_after_cancel.data["active_consultation"]["status"], "CANCELLED")
+        self.assertEqual(detail_after_cancel.data["active_consultation"]["interactionStatus"], "selection_cancelled")
+
+        trend_after_cancel = self.client.get(
+            "/api/v1/admin/trend-report/?days=7",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(trend_after_cancel.status_code, status.HTTP_200_OK)
+        self.assertEqual(trend_after_cancel.data["trendReport"], [])
+
+    def test_confirm_is_idempotent_for_same_active_request(self):
+        client = Client.objects.create(name="Repeat Confirm Tester", phone="01081818888", gender="F")
+        admin = AdminAccount.objects.create(
+            name="Manager Repeat",
+            store_name="MirrAI Repeat",
+            role="owner",
+            phone="01011112223",
+            business_number=build_valid_business_number("456789014"),
+            password_hash="hashed",
+            consent_snapshot={
+                "agree_terms": True,
+                "agree_privacy": True,
+                "agree_third_party_sharing": True,
+            },
+        )
+        survey = Survey.objects.create(
+            client=client,
+            target_length="medium",
+            target_vibe="soft",
+            scalp_type="normal",
+            hair_colour="brown",
+            budget_range="10-15",
+            preference_vector=[1.0] * 20,
+        )
+        capture = CaptureRecord.objects.create(
+            client=client,
+            original_path=None,
+            processed_path=None,
+            filename=None,
+            status="DONE",
+            face_count=1,
+            privacy_snapshot={"storage_policy": "vector_only"},
+        )
+        analysis = FaceAnalysis.objects.create(
+            client=client,
+            face_shape="Oval",
+            golden_ratio_score=0.88,
+            image_url=None,
+            landmark_snapshot={"version": "coarse-v1"},
+        )
+        _, rows = persist_generated_batch(
+            client=client,
+            capture_record=capture,
+            survey=survey,
+            analysis=analysis,
+        )
+
+        first_response = self.client.post(
+            "/api/v1/analysis/confirm/",
+            {
+                "client_id": client.id,
+                "recommendation_id": rows[0].id,
+                "admin_id": admin.id,
+                "source": "current_recommendations",
+                "direct_consultation": False,
+            },
+            format="json",
+        )
+        second_response = self.client.post(
+            "/api/v1/analysis/confirm/",
+            {
+                "client_id": client.id,
+                "recommendation_id": rows[0].id,
+                "admin_id": admin.id,
+                "source": "current_recommendations",
+                "direct_consultation": False,
+            },
+            format="json",
+        )
+
+        self.assertEqual(first_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(second_response.status_code, status.HTTP_200_OK)
+        self.assertFalse(first_response.data["idempotent"])
+        self.assertTrue(second_response.data["idempotent"])
+        self.assertEqual(first_response.data["consultation_id"], second_response.data["consultation_id"])
+        self.assertEqual(ConsultationRequest.objects.filter(client=client).count(), 1)
+        self.assertEqual(ConsultationRequest.objects.filter(client=client, is_active=True).count(), 1)
+        self.assertEqual(StyleSelection.objects.filter(client=client, is_sent_to_admin=True).count(), 1)
+
+    def test_admin_contract_endpoints_include_frontend_friendly_aliases(self):
+        client = Client.objects.create(
+            name="Admin Contract Tester",
+            phone="01010101234",
+            gender="F",
+            birth_year_estimate=1998,
+        )
+        admin = AdminAccount.objects.create(
+            name="Manager Contract",
+            store_name="MirrAI Contract",
+            role="owner",
+            phone="01056565656",
+            business_number=build_valid_business_number("567890123"),
+            password_hash="hashed",
+            consent_snapshot={
+                "agree_terms": True,
+                "agree_privacy": True,
+                "agree_third_party_sharing": True,
+            },
+        )
+        survey = Survey.objects.create(
+            client=client,
+            target_length="medium",
+            target_vibe="chic",
+            scalp_type="normal",
+            hair_colour="brown",
+            budget_range="10-15",
+            preference_vector=[0.5] * 20,
+        )
+        capture = CaptureRecord.objects.create(
+            client=client,
+            original_path=None,
+            processed_path=None,
+            filename=None,
+            status="DONE",
+            face_count=1,
+            privacy_snapshot={"storage_policy": "vector_only"},
+        )
+        analysis = FaceAnalysis.objects.create(
+            client=client,
+            face_shape="Oval",
+            golden_ratio_score=0.9,
+            image_url=None,
+            landmark_snapshot={"version": "coarse-v1"},
+        )
+        _, rows = persist_generated_batch(
+            client=client,
+            capture_record=capture,
+            survey=survey,
+            analysis=analysis,
+        )
+        selected_row = rows[0]
+        survey_snapshot = {
+            "target_length": "medium",
+            "target_vibe": "chic",
+            "budget_range": "10-15",
+            "occasion": "daily",
+            "preferences": ["시크", "볼륨"],
+        }
+        StyleSelection.objects.create(
+            client=client,
+            selected_recommendation=selected_row,
+            style_id=selected_row.style_id_snapshot,
+            source="current_recommendations",
+            survey_snapshot=survey_snapshot,
+            match_score=selected_row.match_score,
+            is_sent_to_admin=True,
+        )
+        consultation = ConsultationRequest.objects.create(
+            client=client,
+            admin=admin,
+            selected_style=selected_row.style,
+            selected_recommendation=selected_row,
+            source="current_recommendations",
+            survey_snapshot=survey_snapshot,
+            status="IN_PROGRESS",
+            is_active=True,
+            is_read=False,
+        )
+        ClientSessionNote.objects.create(
+            consultation=consultation,
+            client=client,
+            admin=admin,
+            content="모발 건조 구간 집중 케어 필요",
+        )
+        token = build_admin_token(admin=admin)
+
+        profile_response = self.client.get(
+            "/api/v1/admin/auth/me/",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(profile_response.status_code, status.HTTP_200_OK)
+        self.assertTrue(profile_response.data["is_authenticated"])
+        self.assertEqual(profile_response.data["next_action"], "admin_dashboard")
+        self.assertEqual(profile_response.data["admin"]["storeName"], "MirrAI Contract")
+        self.assertEqual(profile_response.data["admin"]["displayName"], "Manager Contract")
+
+        dashboard_response = self.client.get(
+            "/api/v1/admin/dashboard/",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(dashboard_response.status_code, status.HTTP_200_OK)
+        self.assertIn("todaySummary", dashboard_response.data)
+        self.assertIn("summaryCards", dashboard_response.data)
+        self.assertIn("topStylesToday", dashboard_response.data)
+        self.assertGreaterEqual(dashboard_response.data["todaySummary"]["recommendations_completed"], 1)
+
+        clients_response = self.client.get(
+            "/api/v1/admin/clients/",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(clients_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(clients_response.data["total_count"], 1)
+        list_item = clients_response.data["items"][0]
+        self.assertEqual(list_item["id"], client.id)
+        self.assertTrue(list_item["isNew"])
+        self.assertEqual(list_item["todayRecommendationId"], selected_row.style_id_snapshot)
+        self.assertEqual(list_item["surveyResults"]["length"], "medium")
+        self.assertEqual(list_item["designerNote"], "모발 건조 구간 집중 케어 필요")
+
+        detail_response = self.client.get(
+            f"/api/v1/admin/clients/detail/?client_id={client.id}",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(detail_response.status_code, status.HTTP_200_OK)
+        self.assertIn("clientSummary", detail_response.data)
+        self.assertIn("customer", detail_response.data)
+        self.assertIn("recommendationHistory", detail_response.data)
+        self.assertEqual(detail_response.data["clientSummary"]["todayRecommendationName"], selected_row.style_name_snapshot)
+        self.assertEqual(detail_response.data["customer"]["todayRecommendationName"], selected_row.style_name_snapshot)
+        self.assertEqual(detail_response.data["clientSummary"]["surveyResults"]["occasion"], "daily")
+        self.assertEqual(detail_response.data["designerNote"], "모발 건조 구간 집중 케어 필요")
+        self.assertGreaterEqual(detail_response.data["clientSummary"]["totalSessions"], 1)
+
+        trend_response = self.client.get(
+            "/api/v1/admin/trend-report/?days=7",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(trend_response.status_code, status.HTTP_200_OK)
+        self.assertIn("trendReport", trend_response.data)
+        self.assertIn("hairstyles", trend_response.data)
+        self.assertIn("chartData", trend_response.data)
+        self.assertEqual(trend_response.data["trendReport"][0]["hairstyleId"], selected_row.style_id_snapshot)
+
+    def test_admin_recommendation_and_style_reports_match_frontend_mock_structure(self):
+        client = Client.objects.create(
+            name="Recommendation Contract Tester",
+            phone="01056561234",
+            gender="F",
+            birth_year_estimate=1996,
+        )
+        admin = AdminAccount.objects.create(
+            name="Manager Recommendation",
+            store_name="MirrAI Recommendation",
+            role="owner",
+            phone="01057575757",
+            business_number=build_valid_business_number("678901234"),
+            password_hash="hashed",
+            consent_snapshot={
+                "agree_terms": True,
+                "agree_privacy": True,
+                "agree_third_party_sharing": True,
+            },
+        )
+        survey = Survey.objects.create(
+            client=client,
+            target_length="medium",
+            target_vibe="natural",
+            scalp_type="straight",
+            hair_colour="brown",
+            budget_range="mid",
+            preference_vector=[0.4] * 20,
+        )
+        capture = CaptureRecord.objects.create(
+            client=client,
+            original_path=None,
+            processed_path=None,
+            filename=None,
+            status="DONE",
+            face_count=1,
+            privacy_snapshot={"storage_policy": "vector_only"},
+        )
+        analysis = FaceAnalysis.objects.create(
+            client=client,
+            face_shape="Round",
+            golden_ratio_score=0.86,
+            image_url=None,
+            landmark_snapshot={"version": "coarse-v1"},
+        )
+        _, rows = persist_generated_batch(
+            client=client,
+            capture_record=capture,
+            survey=survey,
+            analysis=analysis,
+        )
+        selected_row = rows[0]
+        consultation = ConsultationRequest.objects.create(
+            client=client,
+            admin=admin,
+            selected_style=selected_row.style,
+            selected_recommendation=selected_row,
+            source="current_recommendations",
+            survey_snapshot={
+                "target_length": "medium",
+                "target_vibe": "natural",
+                "budget_range": "mid",
+                "occasion": "daily",
+                "preferences": ["내추럴", "볼륨"],
+            },
+            status="PENDING",
+            is_active=True,
+            is_read=False,
+        )
+        ClientSessionNote.objects.create(
+            consultation=consultation,
+            client=client,
+            admin=admin,
+            content="추천 페이지 확인 후 상담 연결 예정",
+        )
+        token = build_admin_token(admin=admin)
+
+        recommendation_response = self.client.get(
+            f"/api/v1/admin/clients/recommendations/?client_id={client.id}",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(recommendation_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(recommendation_response.data["status"], "ready")
+        self.assertIn("clientSummary", recommendation_response.data)
+        self.assertIn("aiProfile", recommendation_response.data)
+        self.assertIn("todayStyle", recommendation_response.data)
+        self.assertIn("recommendedStyles", recommendation_response.data)
+        self.assertIn("hairstyles", recommendation_response.data)
+        self.assertIn("customer", recommendation_response.data)
+        self.assertIn("items", recommendation_response.data)
+        self.assertEqual(recommendation_response.data["clientSummary"]["todayRecommendationId"], selected_row.style_id_snapshot)
+        self.assertEqual(recommendation_response.data["customer"]["todayRecommendationId"], selected_row.style_id_snapshot)
+        self.assertEqual(recommendation_response.data["todayStyle"]["id"], selected_row.style_id_snapshot)
+        self.assertEqual(recommendation_response.data["todayStyleSource"], "batch_rank_1")
+        self.assertEqual(recommendation_response.data["todayStyle"]["sourceRule"], "batch_rank_1")
+        self.assertEqual(recommendation_response.data["todayStyle"]["rank"], 1)
+        self.assertEqual(recommendation_response.data["recommendedStylesPurpose"], "frontend_style_cards")
+        self.assertEqual(recommendation_response.data["itemsPurpose"], "raw_recommendation_rows")
+        self.assertEqual(recommendation_response.data["recommendedStyles"][0]["id"], selected_row.style_id_snapshot)
+        self.assertEqual(recommendation_response.data["hairstyles"][0]["id"], selected_row.style_id_snapshot)
+        self.assertEqual(recommendation_response.data["recommendedStyles"][0]["matchRate"], int(round(selected_row.match_score)))
+        self.assertEqual(recommendation_response.data["items"][0]["style_id"], selected_row.style_id_snapshot)
+        self.assertEqual(recommendation_response.data["aiProfile"]["faceShape"], "Round")
+
+        style_response = self.client.get(
+            f"/api/v1/admin/style-report/?style_id={selected_row.style_id_snapshot}",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(style_response.status_code, status.HTTP_200_OK)
+        self.assertIn("hairstyle", style_response.data)
+        self.assertIn("relatedHairstyles", style_response.data)
+        self.assertEqual(style_response.data["hairstyle"]["id"], selected_row.style_id_snapshot)
+        self.assertIn("faceRatioData", style_response.data["hairstyle"])
+
+    def test_admin_dashboard_and_reports_keep_empty_state_contract(self):
+        admin = AdminAccount.objects.create(
+            name="Manager Empty",
+            store_name="MirrAI Empty",
+            role="owner",
+            phone="01058585858",
+            business_number=build_valid_business_number("789012345"),
+            password_hash="hashed",
+            consent_snapshot={
+                "agree_terms": True,
+                "agree_privacy": True,
+                "agree_third_party_sharing": True,
+            },
+        )
+        token = build_admin_token(admin=admin)
+
+        dashboard_response = self.client.get(
+            "/api/v1/admin/dashboard/",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(dashboard_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(dashboard_response.data["todaySummary"]["total_visits"], 0)
+        self.assertEqual(dashboard_response.data["summaryCards"][0]["value"], 0)
+        self.assertEqual(dashboard_response.data["topStylesToday"], [])
+        self.assertEqual(dashboard_response.data["activeClientsPreview"], [])
+
+        trend_response = self.client.get(
+            "/api/v1/admin/trend-report/?days=7",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(trend_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(trend_response.data["trendReport"], [])
+        self.assertEqual(trend_response.data["hairstyles"], [])
+        self.assertEqual(trend_response.data["chartData"], [])
 

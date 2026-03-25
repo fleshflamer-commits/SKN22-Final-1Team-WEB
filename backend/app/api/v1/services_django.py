@@ -19,7 +19,7 @@ from app.models_django import (
     Survey,
 )
 from app.services.age_profile import build_client_age_profile, client_matches_age_profile
-from app.services.ai_facade import generate_recommendation_batch, simulate_face_analysis
+from app.services.ai_facade import explain_style, generate_recommendation_batch, simulate_face_analysis
 from app.services.storage_service import resolve_storage_reference
 
 
@@ -116,7 +116,15 @@ def build_recommendation_regeneration_snapshot(
     survey,
     analysis: FaceAnalysis | None,
     source: str,
+    capture_record: CaptureRecord | None = None,
 ) -> dict:
+    engine_payload = build_recommendation_engine_payload(
+        client=client,
+        survey=survey,
+        analysis=analysis,
+        source=source,
+        capture_record=capture_record,
+    )
     return {
         "version": "vector-only-v1",
         "source": source,
@@ -139,6 +147,7 @@ def build_recommendation_regeneration_snapshot(
             if analysis
             else None
         ),
+        "engine_payload": engine_payload,
     }
 
 
@@ -164,6 +173,48 @@ def upsert_survey(client: Client, payload: dict) -> Survey:
     return survey
 
 
+def build_recommendation_engine_payload(
+    *,
+    client: Client,
+    survey,
+    analysis: FaceAnalysis | None,
+    source: str,
+    capture_record: CaptureRecord | None = None,
+) -> dict:
+    survey_data = {
+        "target_length": getattr(survey, "target_length", None),
+        "target_vibe": getattr(survey, "target_vibe", None),
+        "scalp_type": getattr(survey, "scalp_type", None),
+        "hair_colour": getattr(survey, "hair_colour", None),
+        "budget_range": getattr(survey, "budget_range", None),
+        "preference_vector": getattr(survey, "preference_vector", None) or [],
+        "age_profile": build_client_age_profile(client),
+    }
+    analysis_data = (
+        {
+            "face_shape": analysis.face_shape,
+            "golden_ratio_score": analysis.golden_ratio_score,
+            "image_url": resolve_storage_reference(analysis.image_url),
+            "landmark_snapshot": analysis.landmark_snapshot,
+            "capture_record_id": (capture_record.id if capture_record else None),
+            "image_storage_policy": (
+                (capture_record.privacy_snapshot or {}).get("storage_policy")
+                if capture_record is not None
+                else "vector_only"
+            ),
+        }
+        if analysis
+        else {}
+    )
+    return {
+        "version": "recommendation-engine-v2",
+        "source": source,
+        "client_id": client.id,
+        "survey_data": survey_data,
+        "analysis_data": analysis_data,
+    }
+
+
 def persist_generated_batch(
     *,
     client: Client,
@@ -172,21 +223,17 @@ def persist_generated_batch(
     analysis: FaceAnalysis,
 ) -> tuple[str, list[FormerRecommendation]]:
     styles_by_id = ensure_catalog_styles()
-    survey_payload = {
-        "target_length": getattr(survey, "target_length", None),
-        "target_vibe": getattr(survey, "target_vibe", None),
-        "scalp_type": getattr(survey, "scalp_type", None),
-        "hair_colour": getattr(survey, "hair_colour", None),
-        "budget_range": getattr(survey, "budget_range", None),
-    }
+    engine_payload = build_recommendation_engine_payload(
+        client=client,
+        survey=survey,
+        analysis=analysis,
+        source="generated",
+        capture_record=capture_record,
+    )
     items = generate_recommendation_batch(
-        client_id=client.id,
-        survey_data=survey_payload,
-        analysis_data={
-            "face_shape": analysis.face_shape,
-            "golden_ratio_score": analysis.golden_ratio_score,
-            "image_url": resolve_storage_reference(analysis.image_url),
-        },
+        client_id=engine_payload["client_id"],
+        survey_data=engine_payload["survey_data"],
+        analysis_data=engine_payload["analysis_data"],
         styles_by_id=styles_by_id,
     )
     regeneration_snapshot = build_recommendation_regeneration_snapshot(
@@ -194,6 +241,7 @@ def persist_generated_batch(
         survey=survey,
         analysis=analysis,
         source="generated",
+        capture_record=capture_record,
     )
 
     batch_id = uuid.uuid4()
@@ -224,6 +272,141 @@ def persist_generated_batch(
     return str(batch_id), list(FormerRecommendation.objects.filter(batch_id=batch_id).order_by("rank", "id"))
 
 
+def persist_survey_only_batch(
+    *,
+    client: Client,
+    survey,
+) -> tuple[str, list[FormerRecommendation]]:
+    styles_by_id = ensure_catalog_styles()
+    items = generate_recommendation_batch(
+        client_id=client.id,
+        survey_data={
+            "target_length": getattr(survey, "target_length", None),
+            "target_vibe": getattr(survey, "target_vibe", None),
+            "scalp_type": getattr(survey, "scalp_type", None),
+            "hair_colour": getattr(survey, "hair_colour", None),
+            "budget_range": getattr(survey, "budget_range", None),
+            "preference_vector": getattr(survey, "preference_vector", None) or [],
+            "age_profile": build_client_age_profile(client),
+        },
+        analysis_data={},
+        styles_by_id=styles_by_id,
+    )
+    regeneration_snapshot = build_recommendation_regeneration_snapshot(
+        client=client,
+        survey=survey,
+        analysis=None,
+        source="survey_only",
+    )
+
+    batch_id = uuid.uuid4()
+    rows: list[FormerRecommendation] = []
+    for item in items:
+        style = styles_by_id.get(item["style_id"])
+        rows.append(
+            FormerRecommendation(
+                client=client,
+                capture_record=None,
+                style=style,
+                batch_id=batch_id,
+                source="survey_only",
+                style_id_snapshot=item["style_id"],
+                style_name_snapshot=item["style_name"],
+                style_description_snapshot=item.get("style_description", ""),
+                keywords=item.get("keywords", []),
+                sample_image_url=None,
+                simulation_image_url=None,
+                regeneration_snapshot=regeneration_snapshot,
+                llm_explanation=item.get("llm_explanation"),
+                reasoning_snapshot=item.get("reasoning_snapshot"),
+                match_score=item.get("match_score"),
+                rank=item.get("rank", 0),
+            )
+        )
+    FormerRecommendation.objects.bulk_create(rows)
+    return str(batch_id), list(FormerRecommendation.objects.filter(batch_id=batch_id).order_by("rank", "id"))
+
+
+def regenerate_recommendation_simulation(
+    *,
+    client: Client,
+    recommendation_id: int,
+) -> dict:
+    row = FormerRecommendation.objects.filter(id=recommendation_id, client=client).first()
+    if row is None:
+        raise ValueError("The recommendation to regenerate could not be found.")
+    if not row.regeneration_snapshot:
+        raise ValueError("This recommendation does not support simulation regeneration.")
+
+    snapshot = row.regeneration_snapshot or {}
+    engine_payload = snapshot.get("engine_payload") or {
+        "client_id": client.id,
+        "survey_data": (snapshot.get("survey_data") or {}),
+        "analysis_data": (snapshot.get("analysis_data") or {}),
+    }
+    styles_by_id = ensure_catalog_styles()
+    items = generate_recommendation_batch(
+        client_id=engine_payload["client_id"],
+        survey_data=engine_payload.get("survey_data") or {},
+        analysis_data=engine_payload.get("analysis_data") or {},
+        styles_by_id=styles_by_id,
+    )
+    regenerated_card = next((item for item in items if item.get("style_id") == row.style_id_snapshot), None)
+    if regenerated_card is None:
+        style_reference = _style_reference(row.style_id_snapshot, styles_by_id=styles_by_id)
+        regenerated_card = {
+            "style_id": row.style_id_snapshot,
+            "style_name": row.style_name_snapshot or style_reference["style_name"],
+            "style_description": row.style_description_snapshot or style_reference["style_description"],
+            "sample_image_url": style_reference["sample_image_url"],
+            "simulation_image_url": None,
+            "llm_explanation": row.llm_explanation or "",
+            "keywords": row.keywords or style_reference["keywords"],
+            "reasoning_snapshot": row.reasoning_snapshot or {"summary": row.llm_explanation or ""},
+            "match_score": row.match_score,
+            "rank": row.rank,
+        }
+
+    explanation = explain_style(card=regenerated_card)
+    reasoning_snapshot = {
+        **(regenerated_card.get("reasoning_snapshot") or row.reasoning_snapshot or {}),
+        "regenerated": True,
+        "source": row.source,
+        "regenerated_at": timezone.now().isoformat(),
+    }
+    return {
+        "status": "success",
+        "recommendation_id": row.id,
+        "client_id": client.id,
+        "image_policy": "vector_only",
+        "can_regenerate_simulation": True,
+        "item": {
+            "id": row.id,
+            "recommendation_id": row.id,
+            "style_id": regenerated_card.get("style_id", row.style_id_snapshot),
+            "style_name": explanation.get("style_name") or regenerated_card.get("style_name") or row.style_name_snapshot,
+            "name": explanation.get("style_name") or regenerated_card.get("style_name") or row.style_name_snapshot,
+            "name_en": explanation.get("style_name") or regenerated_card.get("style_name") or row.style_name_snapshot,
+            "style_description": regenerated_card.get("style_description") or row.style_description_snapshot or "",
+            "description": explanation.get("llm_explanation") or regenerated_card.get("style_description") or row.style_description_snapshot or "",
+            "sample_image_url": explanation.get("sample_image_url") or regenerated_card.get("sample_image_url"),
+            "imageUrl": explanation.get("sample_image_url") or regenerated_card.get("sample_image_url"),
+            "simulation_image_url": explanation.get("simulation_image_url") or regenerated_card.get("simulation_image_url"),
+            "synthetic_image_url": explanation.get("simulation_image_url") or regenerated_card.get("simulation_image_url"),
+            "llm_explanation": explanation.get("llm_explanation") or regenerated_card.get("llm_explanation") or row.llm_explanation or "",
+            "keywords": explanation.get("keywords") or regenerated_card.get("keywords") or row.keywords or [],
+            "tags": explanation.get("keywords") or regenerated_card.get("keywords") or row.keywords or [],
+            "reasoning_snapshot": reasoning_snapshot,
+            "match_score": regenerated_card.get("match_score", row.match_score),
+            "match": int(round(regenerated_card.get("match_score", row.match_score) or 0)),
+            "rank": regenerated_card.get("rank", row.rank),
+            "image_policy": "vector_only",
+            "can_regenerate_simulation": True,
+        },
+        "message": "The simulation payload has been regenerated from the stored vector snapshot.",
+    }
+
+
 def serialize_recommendation_row(row: FormerRecommendation) -> dict:
     reasoning_snapshot = row.reasoning_snapshot or {}
     style_reference = _style_reference(
@@ -233,21 +416,33 @@ def serialize_recommendation_row(row: FormerRecommendation) -> dict:
     uses_vector_only_policy = bool(row.regeneration_snapshot)
     sample_image_url = style_reference["sample_image_url"] or resolve_storage_reference(row.sample_image_url)
     simulation_image_url = None if uses_vector_only_policy else resolve_storage_reference(row.simulation_image_url)
+    style_name = row.style_name_snapshot or style_reference["style_name"]
+    style_description = row.style_description_snapshot or style_reference["style_description"]
+    keywords = row.keywords or style_reference["keywords"]
+    match_score = row.match_score or 0.0
+    description = row.llm_explanation or style_description or ""
     return {
+        "id": row.id,
         "recommendation_id": row.id,
         "batch_id": row.batch_id,
         "source": row.source,
         "style_id": row.style_id_snapshot,
-        "style_name": row.style_name_snapshot or style_reference["style_name"],
-        "style_description": row.style_description_snapshot or style_reference["style_description"],
-        "keywords": row.keywords or style_reference["keywords"],
+        "style_name": style_name,
+        "name": style_name,
+        "name_en": style_name,
+        "style_description": style_description,
+        "description": description,
+        "keywords": keywords,
+        "tags": keywords,
         "sample_image_url": sample_image_url,
+        "imageUrl": sample_image_url,
         "simulation_image_url": simulation_image_url,
         "synthetic_image_url": simulation_image_url,
         "llm_explanation": row.llm_explanation or "",
         "reasoning": reasoning_snapshot.get("summary") or row.llm_explanation or "",
         "reasoning_snapshot": reasoning_snapshot,
-        "match_score": row.match_score or 0.0,
+        "match_score": match_score,
+        "match": int(round(match_score)),
         "rank": row.rank,
         "is_chosen": row.is_chosen,
         "image_policy": ("vector_only" if uses_vector_only_policy else "legacy_asset_store"),
@@ -295,7 +490,7 @@ def serialize_capture_status(record: CaptureRecord) -> dict:
 
 def get_former_recommendations(client: Client) -> dict:
     latest_generated = (
-        FormerRecommendation.objects.filter(client=client, source="generated")
+        FormerRecommendation.objects.filter(client=client, source__in=["generated", "survey_only"])
         .order_by("-created_at")
         .first()
     )
@@ -316,6 +511,7 @@ def get_former_recommendations(client: Client) -> dict:
     return {
         "status": "ready",
         "source": "former_recommendations",
+        "recommendation_mode": "history",
         "items": [_serialize_row(row) for row in rows],
     }
 
@@ -325,15 +521,33 @@ def _ensure_current_batch(client: Client) -> tuple[str | None, list[FormerRecomm
     latest_capture = get_latest_capture(client)
     latest_survey = get_latest_survey(client)
     latest_batch = (
-        FormerRecommendation.objects.filter(client=client, source="generated")
+        FormerRecommendation.objects.filter(client=client, source__in=["generated", "survey_only"])
         .order_by("-created_at")
         .first()
     )
 
+    survey_only_mode = latest_survey is not None and (latest_capture is None or latest_analysis is None)
+    if survey_only_mode:
+        needs_regeneration = latest_batch is None or latest_batch.source != "survey_only"
+        if latest_batch and latest_survey and latest_batch.created_at < latest_survey.created_at:
+            needs_regeneration = True
+
+        if needs_regeneration:
+            _, rows = persist_survey_only_batch(
+                client=client,
+                survey=latest_survey,
+            )
+            return (str(rows[0].batch_id) if rows else None), rows, "survey_only"
+
+        rows = list(
+            FormerRecommendation.objects.filter(client=client, batch_id=latest_batch.batch_id).order_by("rank", "id")
+        )
+        return str(latest_batch.batch_id), rows, "survey_only"
+
     if not latest_capture or not latest_analysis:
         return None, [], "needs_capture"
 
-    needs_regeneration = latest_batch is None
+    needs_regeneration = latest_batch is None or latest_batch.source != "generated"
     if latest_batch and latest_capture and latest_batch.created_at < latest_capture.created_at:
         needs_regeneration = True
     if latest_batch and latest_analysis and latest_batch.created_at < latest_analysis.created_at:
@@ -349,12 +563,12 @@ def _ensure_current_batch(client: Client) -> tuple[str | None, list[FormerRecomm
             survey=survey_context,
             analysis=latest_analysis,
         )
-        return (str(rows[0].batch_id) if rows else None), rows, None
+        return (str(rows[0].batch_id) if rows else None), rows, "generated"
 
     rows = list(
         FormerRecommendation.objects.filter(client=client, batch_id=latest_batch.batch_id).order_by("rank", "id")
     )
-    return str(latest_batch.batch_id), rows, None
+    return str(latest_batch.batch_id), rows, "generated"
 
 
 def get_current_recommendations(client: Client) -> dict:
@@ -371,8 +585,10 @@ def get_current_recommendations(client: Client) -> dict:
         return {
             "status": "needs_capture",
             "source": "current_recommendations",
+            "recommendation_mode": "capture_required",
             "message": latest_capture_attempt.error_note or "Face detection did not succeed. Please retake a front-facing photo.",
             "next_action": "capture",
+            "capture_required_for_full_result": True,
             "items": [],
         }
 
@@ -380,17 +596,9 @@ def get_current_recommendations(client: Client) -> dict:
         return {
             "status": "needs_input",
             "source": "current_recommendations",
+            "recommendation_mode": "needs_input",
             "message": "No survey or capture data is available yet. Start with the survey or upload a capture.",
             "next_actions": ["survey", "capture"],
-            "items": [],
-        }
-
-    if not latest_capture or not latest_analysis:
-        return {
-            "status": "needs_capture",
-            "source": "current_recommendations",
-            "message": "A valid front-facing capture is required before we can generate the current Top-5 recommendations.",
-            "next_action": "capture",
             "items": [],
         }
 
@@ -399,8 +607,10 @@ def get_current_recommendations(client: Client) -> dict:
         return {
             "status": "needs_capture",
             "source": "current_recommendations",
+            "recommendation_mode": "capture_required",
             "message": "Capture data is not ready yet. Please complete capture before requesting current recommendations.",
             "next_action": "capture",
+            "capture_required_for_full_result": True,
             "items": [],
         }
 
@@ -411,6 +621,18 @@ def get_current_recommendations(client: Client) -> dict:
             next_action="capture",
         )
 
+    if status_code == "survey_only":
+        return {
+            "status": "ready",
+            "source": "current_recommendations",
+            "recommendation_mode": "survey_only",
+            "batch_id": batch_id,
+            "message": "The current Top-5 recommendations were generated from survey data only. Adding a capture can improve personalization.",
+            "next_actions": ["capture"],
+            "capture_required_for_full_result": True,
+            "items": [_serialize_row(row) for row in rows],
+        }
+
     message = "The latest Top-5 recommendations were generated from the most recent capture and analysis."
     if latest_survey is None:
         message = "The latest Top-5 recommendations were generated from face analysis only because survey data is not available."
@@ -418,8 +640,10 @@ def get_current_recommendations(client: Client) -> dict:
     return {
         "status": "ready",
         "source": "current_recommendations",
+        "recommendation_mode": "capture_analysis",
         "batch_id": batch_id,
         "message": message,
+        "capture_required_for_full_result": False,
         "items": [_serialize_row(row) for row in rows],
     }
 
@@ -428,7 +652,9 @@ def get_trend_recommendations(*, days: int = 30, client: Client | None = None) -
     cutoff = timezone.now() - timezone.timedelta(days=days)
     target_age_profile = build_client_age_profile(client) if client else None
     selections = list(
-        StyleSelection.objects.filter(created_at__gte=cutoff).select_related("client").order_by("-created_at")
+        StyleSelection.objects.filter(created_at__gte=cutoff, is_sent_to_admin=True)
+        .select_related("client")
+        .order_by("-created_at")
     )
     scoped_selections = selections
     trend_scope = "global"
@@ -529,6 +755,7 @@ def get_trend_recommendations(*, days: int = 30, client: Client | None = None) -
     return {
         "status": "ready",
         "source": "trend",
+        "recommendation_mode": "trend",
         "days": days,
         "trend_scope": trend_scope,
         "age_profile": target_age_profile,
@@ -563,16 +790,6 @@ def confirm_style_selection(
         selected_row = FormerRecommendation.objects.filter(id=recommendation_id, client=client).first()
         if not selected_row:
             raise ValueError("The selected recommendation could not be found.")
-
-        FormerRecommendation.objects.filter(client=client, batch_id=selected_row.batch_id).update(
-            is_chosen=False,
-            chosen_at=None,
-        )
-        selected_row.is_chosen = True
-        selected_row.chosen_at = timezone.now()
-        selected_row.is_sent_to_admin = True
-        selected_row.sent_at = timezone.now()
-        selected_row.save(update_fields=["is_chosen", "chosen_at", "is_sent_to_admin", "sent_at"])
         style_id = selected_row.style_id_snapshot
         selected_style = selected_row.style or Style.objects.filter(id=style_id).first()
 
@@ -589,92 +806,143 @@ def confirm_style_selection(
             .order_by("-created_at")
             .first()
         )
-        if selected_row:
+
+    if not direct_consultation and selected_style is None:
+        raise ValueError("Style information is required to confirm a selection.")
+
+    active_consultation = (
+        ConsultationRequest.objects.filter(client=client, is_active=True)
+        .select_related("selected_style", "selected_recommendation")
+        .order_by("-created_at")
+        .first()
+    )
+    target_style_id = None if direct_consultation else (selected_style.id if selected_style else None)
+    target_recommendation_id = selected_row.id if selected_row else None
+    is_same_active_request = bool(
+        active_consultation
+        and active_consultation.source == source
+        and active_consultation.admin_id == (admin.id if admin else None)
+        and active_consultation.selected_style_id == target_style_id
+        and active_consultation.selected_recommendation_id == target_recommendation_id
+        and active_consultation.status in {"PENDING", "IN_PROGRESS"}
+    )
+
+    if is_same_active_request:
+        consultation = active_consultation
+    else:
+        chosen_at = timezone.now()
+        if selected_row is not None:
             FormerRecommendation.objects.filter(client=client, batch_id=selected_row.batch_id).update(
                 is_chosen=False,
                 chosen_at=None,
             )
             selected_row.is_chosen = True
-            selected_row.chosen_at = timezone.now()
+            selected_row.chosen_at = chosen_at
             selected_row.is_sent_to_admin = True
-            selected_row.sent_at = timezone.now()
+            selected_row.sent_at = chosen_at
             selected_row.save(update_fields=["is_chosen", "chosen_at", "is_sent_to_admin", "sent_at"])
 
-    if not direct_consultation and selected_style is None:
-        raise ValueError("Style information is required to confirm a selection.")
+        if recommendation_id is None and selected_style is not None and source == "trend":
+            explanation = selected_style.description or "This style was selected from the current salon trend list."
+            regeneration_snapshot = build_recommendation_regeneration_snapshot(
+                client=client,
+                survey=(get_latest_survey(client) or build_default_survey_context(client.id)),
+                analysis=latest_analysis,
+                source="trend",
+            )
+            selected_row = FormerRecommendation.objects.create(
+                client=client,
+                style=selected_style,
+                batch_id=uuid.uuid4(),
+                source="trend",
+                style_id_snapshot=selected_style.id,
+                style_name_snapshot=selected_style.name,
+                style_description_snapshot=selected_style.description or "",
+                keywords=[selected_style.vibe] if selected_style.vibe else [],
+                sample_image_url=None,
+                simulation_image_url=None,
+                regeneration_snapshot=regeneration_snapshot,
+                llm_explanation=explanation,
+                reasoning_snapshot={
+                    "summary": "trend selection promoted to consultation",
+                    "source": "trend",
+                },
+                match_score=None,
+                rank=1,
+                is_chosen=not direct_consultation,
+                chosen_at=(chosen_at if not direct_consultation else None),
+                is_sent_to_admin=True,
+                sent_at=chosen_at,
+            )
 
-    if recommendation_id is None and selected_style is not None and source == "trend":
-        explanation = selected_style.description or "This style was selected from the current salon trend list."
-        regeneration_snapshot = build_recommendation_regeneration_snapshot(
-            client=client,
-            survey=(get_latest_survey(client) or build_default_survey_context(client.id)),
-            analysis=latest_analysis,
-            source="trend",
-        )
-        selected_row = FormerRecommendation.objects.create(
-            client=client,
-            style=selected_style,
-            batch_id=uuid.uuid4(),
-            source="trend",
-            style_id_snapshot=selected_style.id,
-            style_name_snapshot=selected_style.name,
-            style_description_snapshot=selected_style.description or "",
-            keywords=[selected_style.vibe] if selected_style.vibe else [],
-            sample_image_url=None,
-            simulation_image_url=None,
-            regeneration_snapshot=regeneration_snapshot,
-            llm_explanation=explanation,
-            reasoning_snapshot={
-                "summary": "trend selection promoted to consultation",
-                "source": "trend",
-            },
-            match_score=None,
-            rank=1,
-            is_chosen=not direct_consultation,
-            chosen_at=(timezone.now() if not direct_consultation else None),
-            is_sent_to_admin=True,
-            sent_at=timezone.now(),
+        if not direct_consultation and selected_style is not None:
+            selection_queryset = StyleSelection.objects.filter(
+                client=client,
+                style_id=selected_style.id,
+                source=source,
+            )
+            if selected_row is not None:
+                selection_queryset = selection_queryset.filter(selected_recommendation=selected_row)
+            existing_selection = selection_queryset.order_by("-created_at").first()
+            if existing_selection is not None and not existing_selection.is_sent_to_admin:
+                existing_selection.selected_recommendation = selected_row
+                existing_selection.survey_snapshot = survey_snapshot
+                existing_selection.match_score = selected_row.match_score if selected_row else None
+                existing_selection.is_sent_to_admin = True
+                existing_selection.save(
+                    update_fields=[
+                        "selected_recommendation",
+                        "survey_snapshot",
+                        "match_score",
+                        "is_sent_to_admin",
+                    ]
+                )
+            else:
+                StyleSelection.objects.create(
+                    client=client,
+                    selected_recommendation=selected_row,
+                    style_id=selected_style.id,
+                    source=source,
+                    survey_snapshot=survey_snapshot,
+                    match_score=(selected_row.match_score if selected_row else None),
+                    is_sent_to_admin=True,
+                )
+
+        ConsultationRequest.objects.filter(client=client, is_active=True).update(
+            is_active=False,
+            status="CLOSED",
+            closed_at=chosen_at,
+            is_read=True,
         )
 
-    if not direct_consultation and selected_style is not None:
-        StyleSelection.objects.create(
+        consultation = ConsultationRequest.objects.create(
             client=client,
+            selected_style=(None if direct_consultation else selected_style),
             selected_recommendation=selected_row,
-            style_id=selected_style.id,
+            admin=admin,
             source=source,
             survey_snapshot=survey_snapshot,
-            match_score=(selected_row.match_score if selected_row else None),
-            is_sent_to_admin=True,
+            analysis_data_snapshot=analysis_snapshot,
+            status="PENDING",
+            is_active=True,
+            is_read=False,
         )
-
-    ConsultationRequest.objects.filter(client=client, is_active=True).update(
-        is_active=False,
-        status="CLOSED",
-        closed_at=timezone.now(),
-        is_read=True,
-    )
-
-    consultation = ConsultationRequest.objects.create(
-        client=client,
-        selected_style=(None if direct_consultation else selected_style),
-        selected_recommendation=selected_row,
-        admin=admin,
-        source=source,
-        survey_snapshot=survey_snapshot,
-        analysis_data_snapshot=analysis_snapshot,
-        status="PENDING",
-        is_active=True,
-        is_read=False,
-    )
 
     return {
         "status": "success",
         "consultation_id": consultation.id,
+        "consultation_status": consultation.status,
+        "consultationStatus": consultation.status,
+        "current_step": "consultation",
+        "currentStep": "consultation",
+        "interaction_status": "confirmed_waiting_admin",
+        "interactionStatus": "confirmed_waiting_admin",
         "selected_style_id": (selected_style.id if selected_style else None),
         "selected_style_name": (selected_style.name if selected_style else None),
         "source": source,
         "direct_consultation": direct_consultation,
         "recommendation_id": (selected_row.id if selected_row else None),
+        "idempotent": is_same_active_request,
         "message": (
             "A direct consultation request has been sent to the admin."
             if direct_consultation
@@ -737,12 +1005,38 @@ def cancel_style_selection(
                 is_sent_to_admin=False,
                 sent_at=None,
             )
+            updated_rows = StyleSelection.objects.filter(
+                client=client,
+                selected_recommendation=selected_row,
+                is_sent_to_admin=True,
+            ).update(is_sent_to_admin=False)
+            if updated_rows == 0:
+                latest_selection = (
+                    StyleSelection.objects.filter(
+                        client=client,
+                        style_id=selected_row.style_id_snapshot,
+                        is_sent_to_admin=True,
+                    )
+                    .order_by("-created_at")
+                    .first()
+                )
+                if latest_selection is not None:
+                    latest_selection.is_sent_to_admin = False
+                    latest_selection.save(update_fields=["is_sent_to_admin"])
 
     return {
         "status": "cancelled",
         "client_id": client.id,
         "source": source,
         "next_action": "client_input",
+        "nextAction": "client_input",
+        "current_step": "client_input",
+        "currentStep": "client_input",
+        "interaction_status": "selection_cancelled",
+        "interactionStatus": "selection_cancelled",
+        "consultation_status": "CANCELLED",
+        "consultationStatus": "CANCELLED",
+        "idempotent": not ConsultationRequest.objects.filter(client=client, is_active=True).exists() and selected_row is None,
         "message": "The selected style has been cancelled and the flow can return to the client input step.",
     }
 

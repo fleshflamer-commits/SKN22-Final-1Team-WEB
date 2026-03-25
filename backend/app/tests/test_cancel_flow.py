@@ -108,3 +108,51 @@ class CancelStyleSelectionApiTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("detail", response.data)
 
+    def test_cancel_is_safe_when_repeated_after_first_cancel(self):
+        batch_id = uuid.uuid4()
+        selected_row = FormerRecommendation.objects.create(
+            client=self.client_profile,
+            style=self.style,
+            batch_id=batch_id,
+            source="generated",
+            style_id_snapshot=self.style.id,
+            style_name_snapshot=self.style.name,
+            style_description_snapshot=self.style.description,
+            keywords=["natural"],
+            sample_image_url="styles/soft-layered-bob.jpg",
+            simulation_image_url="captures/result.jpg",
+            llm_explanation="Best match for repeated cancel testing.",
+            match_score=92.0,
+            rank=1,
+            is_chosen=True,
+            chosen_at=timezone.now(),
+            is_sent_to_admin=True,
+            sent_at=timezone.now(),
+        )
+        ConsultationRequest.objects.create(
+            client=self.client_profile,
+            selected_style=self.style,
+            selected_recommendation=selected_row,
+            source="current_recommendations",
+            status="PENDING",
+            is_active=True,
+            is_read=False,
+        )
+
+        first_response = self.client.post(
+            "/api/v1/analysis/cancel/",
+            {"client_id": self.client_profile.id},
+            format="json",
+        )
+        second_response = self.client.post(
+            "/api/v1/analysis/cancel/",
+            {"client_id": self.client_profile.id},
+            format="json",
+        )
+
+        self.assertEqual(first_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(second_response.status_code, status.HTTP_200_OK)
+        self.assertFalse(first_response.data["idempotent"])
+        self.assertTrue(second_response.data["idempotent"])
+        self.assertEqual(ConsultationRequest.objects.filter(client=self.client_profile, is_active=True).count(), 0)
+
