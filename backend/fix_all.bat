@@ -9,7 +9,7 @@ docker-compose down 2>nul
 
 echo [3] Cleaning up database and migrations...
 if exist db.sqlite3 del /F /Q db.sqlite3
-if exist api\migrations\0001_initial.py del /F /Q api\migrations\0001_initial.py
+if exist app\migrations\0001_initial.py del /F /Q app\migrations\0001_initial.py
 
 echo [4] Installing Dependencies from requirements.txt...
 python -m pip install -r requirements.txt
@@ -20,13 +20,10 @@ if %ERRORLEVEL% neq 0 (
 )
 
 echo [5] Initializing Django Database...
-python manage.py makemigrations api
+python manage.py makemigrations mirrai_app
 python manage.py migrate
 
-echo [6] Seeding initial data...
-python seed_data.py
-
-echo [7] Starting Django Server (MirrAI Backend) on Port 8001...
+echo [6] Starting Django Server (MirrAI Backend) on Port 8001...
 python manage.py runserver 8001
 if %ERRORLEVEL% neq 0 (
     echo [ERROR] Server failed to start.

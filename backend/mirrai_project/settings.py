@@ -35,7 +35,7 @@ INSTALLED_APPS = [
     'corsheaders',
     
     # Local apps
-    'api',
+    'app.apps.AppConfig',
     'drf_spectacular',
 ]
 

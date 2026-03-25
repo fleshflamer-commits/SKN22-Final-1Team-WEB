@@ -17,7 +17,7 @@ except ImportError:
 urlpatterns = [
     path('', root_check),
     path('admin/', admin.site.urls),
-    path('api/v1/', include('api.urls')),
+    path('api/v1/', include('app.api.v1.urls_django')),
 ]
 
 if HAS_SPECTACULAR:
