@@ -29,8 +29,18 @@ terraform.tfstate*
 .DS_Store
 Thumbs.db
 
+.terraform/
+terraform/.terraform/
+*.tfstate
+*.tfstate.*
+
+backend/db.sqlite3
+backend/mirrai.db
+backend/storage/
+
 # PDF storage folder (commit 제외)
 PDF/
+
 # Tasks & Planning
 tasks/
 .agents/

@@ -1,0 +1,51 @@
+from django.urls import path
+
+from .django_views import (
+    CaptureUploadView,
+    ConsultView,
+    ConfirmView,
+    CustomerCheckView,
+    FormerRecommendationView,
+    LoginView,
+    RecommendationView,
+    RegisterView,
+    SurveyView,
+    TrendView,
+)
+from .admin_views import (
+    ActiveCustomerSessionsView,
+    AdminCustomerDetailView,
+    AdminCustomerRecommendationView,
+    AdminDashboardView,
+    AdminTrendReportView,
+    AllCustomersView,
+    ConsultationCloseView,
+    ConsultationNoteView,
+    PartnerLoginView,
+    PartnerRegisterView,
+    StyleReportView,
+)
+
+urlpatterns = [
+    path('auth/login/', LoginView.as_view(), name='login'),
+    path('auth/check/', CustomerCheckView.as_view(), name='check'),
+    path('auth/register/', RegisterView.as_view(), name='register'),
+    path('survey/', SurveyView.as_view(), name='survey'),
+    path('capture/upload/', CaptureUploadView.as_view(), name='upload'),
+    path('analysis/former-recommendations/', FormerRecommendationView.as_view(), name='former-recommendations'),
+    path('analysis/recommendations/', RecommendationView.as_view(), name='recommendations'),
+    path('analysis/trend/', TrendView.as_view(), name='trend'),
+    path('analysis/confirm/', ConfirmView.as_view(), name='confirm'),
+    path('analysis/consult/', ConsultView.as_view(), name='consult'),
+    path('admin/auth/register/', PartnerRegisterView.as_view(), name='partner-register'),
+    path('admin/auth/login/', PartnerLoginView.as_view(), name='partner-login'),
+    path('admin/dashboard/', AdminDashboardView.as_view(), name='admin-dashboard'),
+    path('admin/customers/active/', ActiveCustomerSessionsView.as_view(), name='admin-active-customers'),
+    path('admin/customers/', AllCustomersView.as_view(), name='admin-customers'),
+    path('admin/customers/detail/', AdminCustomerDetailView.as_view(), name='admin-customer-detail'),
+    path('admin/customers/recommendations/', AdminCustomerRecommendationView.as_view(), name='admin-customer-recommendations'),
+    path('admin/consultations/note/', ConsultationNoteView.as_view(), name='admin-consultation-note'),
+    path('admin/consultations/close/', ConsultationCloseView.as_view(), name='admin-consultation-close'),
+    path('admin/trend-report/', AdminTrendReportView.as_view(), name='admin-trend-report'),
+    path('admin/style-report/', StyleReportView.as_view(), name='admin-style-report'),
+]
