@@ -192,6 +192,11 @@ def extract_landmark_snapshot(*, processed_bytes: bytes) -> dict:
     nose_tip_x = (left_eye[0] + right_eye[0] + (mouth_center[0] * 1.2)) / 3.2
     nose_tip_y = (left_eye[1] + right_eye[1] + (mouth_center[1] * 1.4)) / 3.4
     chin_center = (face_x + (face_width / 2.0), face_y + (face_height * 0.94))
+    forehead_center = (face_x + (face_width / 2.0), face_y + (face_height * 0.16))
+    left_cheek = (face_x + (face_width * 0.18), face_y + (face_height * 0.58))
+    right_cheek = (face_x + (face_width * 0.82), face_y + (face_height * 0.58))
+    jaw_left = (face_x + (face_width * 0.14), face_y + (face_height * 0.88))
+    jaw_right = (face_x + (face_width * 0.86), face_y + (face_height * 0.88))
 
     eye_distance = math.dist(left_eye, right_eye)
     eye_line_angle_deg = math.degrees(math.atan2(right_eye[1] - left_eye[1], right_eye[0] - left_eye[0]))
@@ -237,6 +242,46 @@ def extract_landmark_snapshot(*, processed_bytes: bytes) -> dict:
             width=width,
             height=height,
         ),
+        "forehead_center": _point_payload(
+            x=forehead_center[0],
+            y=forehead_center[1],
+            source="derived",
+            confidence=0.44,
+            width=width,
+            height=height,
+        ),
+        "left_cheek": _point_payload(
+            x=left_cheek[0],
+            y=left_cheek[1],
+            source="derived",
+            confidence=0.41,
+            width=width,
+            height=height,
+        ),
+        "right_cheek": _point_payload(
+            x=right_cheek[0],
+            y=right_cheek[1],
+            source="derived",
+            confidence=0.41,
+            width=width,
+            height=height,
+        ),
+        "jaw_left": _point_payload(
+            x=jaw_left[0],
+            y=jaw_left[1],
+            source="derived",
+            confidence=0.39,
+            width=width,
+            height=height,
+        ),
+        "jaw_right": _point_payload(
+            x=jaw_right[0],
+            y=jaw_right[1],
+            source="derived",
+            confidence=0.39,
+            width=width,
+            height=height,
+        ),
     }
 
     return {
@@ -261,6 +306,8 @@ def extract_landmark_snapshot(*, processed_bytes: bytes) -> dict:
             "detected_feature_count": len(landmarks),
             "eye_line_angle_deg": round(float(eye_line_angle_deg), 2),
             "eye_distance_px": round(float(eye_distance), 2),
+            "landmark_profile": "enhanced_coarse",
+            "mesh_ready": False,
         },
     }
 
@@ -308,7 +355,10 @@ def build_deidentified_capture(*, processed_bytes: bytes, landmark_snapshot: dic
     landmarks = snapshot.get("landmarks") or {}
     left_eye = (landmarks.get("left_eye") or {}).get("point")
     right_eye = (landmarks.get("right_eye") or {}).get("point")
+    nose_tip = (landmarks.get("nose_tip") or {}).get("point")
+    mouth_center = (landmarks.get("mouth_center") or {}).get("point")
     eye_bar_applied = False
+    feature_mask_applied = False
     if left_eye and right_eye:
         eye_bar_height = max(8, int(face_height * 0.12))
         bar_padding = max(6, int(face_width * 0.06))
@@ -319,6 +369,16 @@ def build_deidentified_capture(*, processed_bytes: bytes, landmark_snapshot: dic
         bar_end_y = min(height, bar_center_y + (eye_bar_height // 2))
         cv2.rectangle(decoded, (bar_start_x, bar_start_y), (bar_end_x, bar_end_y), (0, 0, 0), thickness=-1)
         eye_bar_applied = True
+
+    if nose_tip and mouth_center:
+        center_x = int((float(nose_tip["x"]) + float(mouth_center["x"])) / 2.0)
+        center_y = int((float(nose_tip["y"]) + float(mouth_center["y"])) / 2.0)
+        axes = (
+            max(18, int(face_width * 0.22)),
+            max(22, int(face_height * 0.2)),
+        )
+        cv2.ellipse(decoded, (center_x, center_y), axes, 0, 0, 360, (0, 0, 0), thickness=-1)
+        feature_mask_applied = True
 
     success, encoded = cv2.imencode(".jpg", decoded, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
     if not success:
@@ -332,8 +392,9 @@ def build_deidentified_capture(*, processed_bytes: bytes, landmark_snapshot: dic
     privacy_snapshot = {
         "metadata_removed": True,
         "deidentification_applied": True,
-        "method": "pixelate_face_region",
+        "method": "pixelate_face_region_with_feature_mask",
         "eye_bar_applied": eye_bar_applied,
+        "feature_mask_applied": feature_mask_applied,
         "masked_region": {
             "x": start_x,
             "y": start_y,
