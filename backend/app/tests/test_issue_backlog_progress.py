@@ -523,6 +523,138 @@ class BackendIssueProgressTests(APITestCase):
         self.assertEqual(admin_response.status_code, status.HTTP_200_OK)
         self.assertGreaterEqual(admin_response.data["today_metrics"]["active_clients"], 1)
 
+    def test_confirm_and_cancel_sync_admin_dashboard_and_client_contract(self):
+        client = Client.objects.create(name="Action Contract Tester", phone="01028284444", gender="F")
+        admin = AdminAccount.objects.create(
+            name="Manager Action",
+            store_name="MirrAI Action",
+            role="owner",
+            phone="01098981111",
+            business_number=build_valid_business_number("456789013"),
+            password_hash="hashed",
+            consent_snapshot={
+                "agree_terms": True,
+                "agree_privacy": True,
+                "agree_third_party_sharing": True,
+            },
+        )
+        survey = Survey.objects.create(
+            client=client,
+            target_length="medium",
+            target_vibe="soft",
+            scalp_type="normal",
+            hair_colour="brown",
+            budget_range="10-15",
+            preference_vector=[1.0] * 20,
+        )
+        capture = CaptureRecord.objects.create(
+            client=client,
+            original_path=None,
+            processed_path=None,
+            filename=None,
+            status="DONE",
+            face_count=1,
+            privacy_snapshot={"storage_policy": "vector_only"},
+        )
+        analysis = FaceAnalysis.objects.create(
+            client=client,
+            face_shape="Oval",
+            golden_ratio_score=0.88,
+            image_url=None,
+            landmark_snapshot={"version": "coarse-v1"},
+        )
+        _, rows = persist_generated_batch(
+            client=client,
+            capture_record=capture,
+            survey=survey,
+            analysis=analysis,
+        )
+        token = build_admin_token(admin=admin)
+
+        confirm_response = self.client.post(
+            "/api/v1/analysis/confirm/",
+            {
+                "client_id": client.id,
+                "recommendation_id": rows[0].id,
+                "admin_id": admin.id,
+                "source": "current_recommendations",
+                "direct_consultation": False,
+            },
+            format="json",
+        )
+
+        self.assertEqual(confirm_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(confirm_response.data["current_step"], "consultation")
+        self.assertEqual(confirm_response.data["interaction_status"], "confirmed_waiting_admin")
+
+        dashboard_after_confirm = self.client.get(
+            "/api/v1/admin/dashboard/",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(dashboard_after_confirm.status_code, status.HTTP_200_OK)
+        self.assertEqual(dashboard_after_confirm.data["todaySummary"]["recommendations_completed"], 1)
+        self.assertEqual(dashboard_after_confirm.data["activeClientsPreview"][0]["currentStep"], "consultation")
+        self.assertEqual(
+            dashboard_after_confirm.data["activeClientsPreview"][0]["interactionStatus"],
+            "confirmed_waiting_admin",
+        )
+
+        clients_after_confirm = self.client.get(
+            "/api/v1/admin/clients/",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(clients_after_confirm.status_code, status.HTTP_200_OK)
+        confirmed_client = clients_after_confirm.data["items"][0]
+        self.assertEqual(confirmed_client["currentStep"], "consultation")
+        self.assertEqual(confirmed_client["interactionStatus"], "confirmed_waiting_admin")
+
+        cancel_response = self.client.post(
+            "/api/v1/analysis/cancel/",
+            {"client_id": client.id, "recommendation_id": rows[0].id},
+            format="json",
+        )
+        self.assertEqual(cancel_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(cancel_response.data["current_step"], "client_input")
+        self.assertEqual(cancel_response.data["interaction_status"], "selection_cancelled")
+
+        selection = StyleSelection.objects.filter(client=client).latest("created_at")
+        self.assertFalse(selection.is_sent_to_admin)
+
+        dashboard_after_cancel = self.client.get(
+            "/api/v1/admin/dashboard/",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(dashboard_after_cancel.status_code, status.HTTP_200_OK)
+        self.assertEqual(dashboard_after_cancel.data["todaySummary"]["recommendations_completed"], 0)
+        self.assertEqual(dashboard_after_cancel.data["topStylesToday"], [])
+        self.assertEqual(dashboard_after_cancel.data["activeClientsPreview"], [])
+
+        clients_after_cancel = self.client.get(
+            "/api/v1/admin/clients/",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(clients_after_cancel.status_code, status.HTTP_200_OK)
+        cancelled_client = clients_after_cancel.data["items"][0]
+        self.assertEqual(cancelled_client["currentStep"], "client_input")
+        self.assertEqual(cancelled_client["interactionStatus"], "selection_cancelled")
+
+        detail_after_cancel = self.client.get(
+            f"/api/v1/admin/clients/detail/?client_id={client.id}",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(detail_after_cancel.status_code, status.HTTP_200_OK)
+        self.assertEqual(detail_after_cancel.data["clientSummary"]["currentStep"], "client_input")
+        self.assertEqual(detail_after_cancel.data["clientSummary"]["interactionStatus"], "selection_cancelled")
+        self.assertEqual(detail_after_cancel.data["active_consultation"]["status"], "CANCELLED")
+        self.assertEqual(detail_after_cancel.data["active_consultation"]["interactionStatus"], "selection_cancelled")
+
+        trend_after_cancel = self.client.get(
+            "/api/v1/admin/trend-report/?days=7",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(trend_after_cancel.status_code, status.HTTP_200_OK)
+        self.assertEqual(trend_after_cancel.data["trendReport"], [])
+
     def test_admin_contract_endpoints_include_frontend_friendly_aliases(self):
         client = Client.objects.create(
             name="Admin Contract Tester",

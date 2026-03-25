@@ -652,7 +652,9 @@ def get_trend_recommendations(*, days: int = 30, client: Client | None = None) -
     cutoff = timezone.now() - timezone.timedelta(days=days)
     target_age_profile = build_client_age_profile(client) if client else None
     selections = list(
-        StyleSelection.objects.filter(created_at__gte=cutoff).select_related("client").order_by("-created_at")
+        StyleSelection.objects.filter(created_at__gte=cutoff, is_sent_to_admin=True)
+        .select_related("client")
+        .order_by("-created_at")
     )
     scoped_selections = selections
     trend_scope = "global"
@@ -895,6 +897,12 @@ def confirm_style_selection(
     return {
         "status": "success",
         "consultation_id": consultation.id,
+        "consultation_status": consultation.status,
+        "consultationStatus": consultation.status,
+        "current_step": "consultation",
+        "currentStep": "consultation",
+        "interaction_status": "confirmed_waiting_admin",
+        "interactionStatus": "confirmed_waiting_admin",
         "selected_style_id": (selected_style.id if selected_style else None),
         "selected_style_name": (selected_style.name if selected_style else None),
         "source": source,
@@ -962,12 +970,37 @@ def cancel_style_selection(
                 is_sent_to_admin=False,
                 sent_at=None,
             )
+            updated_rows = StyleSelection.objects.filter(
+                client=client,
+                selected_recommendation=selected_row,
+                is_sent_to_admin=True,
+            ).update(is_sent_to_admin=False)
+            if updated_rows == 0:
+                latest_selection = (
+                    StyleSelection.objects.filter(
+                        client=client,
+                        style_id=selected_row.style_id_snapshot,
+                        is_sent_to_admin=True,
+                    )
+                    .order_by("-created_at")
+                    .first()
+                )
+                if latest_selection is not None:
+                    latest_selection.is_sent_to_admin = False
+                    latest_selection.save(update_fields=["is_sent_to_admin"])
 
     return {
         "status": "cancelled",
         "client_id": client.id,
         "source": source,
         "next_action": "client_input",
+        "nextAction": "client_input",
+        "current_step": "client_input",
+        "currentStep": "client_input",
+        "interaction_status": "selection_cancelled",
+        "interactionStatus": "selection_cancelled",
+        "consultation_status": "CANCELLED",
+        "consultationStatus": "CANCELLED",
         "message": "The selected style has been cancelled and the flow can return to the client input step.",
     }
 
