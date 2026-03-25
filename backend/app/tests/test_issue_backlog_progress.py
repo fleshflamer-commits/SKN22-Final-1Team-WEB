@@ -966,8 +966,14 @@ class BackendIssueProgressTests(APITestCase):
         self.assertIn("items", recommendation_response.data)
         self.assertEqual(recommendation_response.data["clientSummary"]["todayRecommendationId"], selected_row.style_id_snapshot)
         self.assertEqual(recommendation_response.data["todayStyle"]["id"], selected_row.style_id_snapshot)
+        self.assertEqual(recommendation_response.data["todayStyleSource"], "batch_rank_1")
+        self.assertEqual(recommendation_response.data["todayStyle"]["sourceRule"], "batch_rank_1")
+        self.assertEqual(recommendation_response.data["todayStyle"]["rank"], 1)
+        self.assertEqual(recommendation_response.data["recommendedStylesPurpose"], "frontend_style_cards")
+        self.assertEqual(recommendation_response.data["itemsPurpose"], "raw_recommendation_rows")
         self.assertEqual(recommendation_response.data["recommendedStyles"][0]["id"], selected_row.style_id_snapshot)
         self.assertEqual(recommendation_response.data["recommendedStyles"][0]["matchRate"], int(round(selected_row.match_score)))
+        self.assertEqual(recommendation_response.data["items"][0]["style_id"], selected_row.style_id_snapshot)
         self.assertEqual(recommendation_response.data["aiProfile"]["faceShape"], "Round")
 
         style_response = self.client.get(

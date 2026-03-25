@@ -41,15 +41,12 @@ def _serialize_client_summary(client: Client) -> dict:
     return ClientSerializer(client).data
 
 
-def _serialize_client_auth_payload(client: Client) -> dict:
+def _serialize_client_auth_payload(client: Client, *, include_token: bool = True) -> dict:
     age_profile = build_client_age_profile(client) or {}
-    return {
+    payload = {
         "status": "success",
         "is_authenticated": True,
         "is_existing": True,
-        "access_token": build_client_token(client=client),
-        "token_type": "bearer",
-        "expires_in": TOKEN_MAX_AGE_SECONDS,
         "client_id": client.id,
         "name": client.name,
         "gender": client.gender,
@@ -61,8 +58,19 @@ def _serialize_client_auth_payload(client: Client) -> dict:
         "image_storage_consent": client.image_storage_consent,
         "image_storage_consented_at": client.image_storage_consented_at,
         "next_action": "dashboard",
+        "nextAction": "dashboard",
         "client": _serialize_client_summary(client),
+        "clientSummary": _serialize_client_summary(client),
     }
+    if include_token:
+        payload.update(
+            {
+                "access_token": build_client_token(client=client),
+                "token_type": "bearer",
+                "expires_in": TOKEN_MAX_AGE_SECONDS,
+            }
+        )
+    return payload
 
 
 def _parse_bool_value(raw_value, *, default: bool | None = None) -> bool | None:
@@ -179,28 +187,11 @@ class ClientCheckView(ClientContextAPIView):
                     "is_authenticated": False,
                     "is_existing": False,
                     "next_action": "register",
+                    "nextAction": "register",
                 }
             )
 
-        age_profile = build_client_age_profile(client) or {}
-        return Response(
-            {
-                "status": "success",
-                "is_authenticated": True,
-                "is_existing": True,
-                "name": client.name,
-                "gender": client.gender,
-                "client_id": client.id,
-                "age": age_profile.get("current_age"),
-                "age_decade": age_profile.get("age_decade"),
-                "age_segment": age_profile.get("age_segment"),
-                "age_group": age_profile.get("age_group"),
-                "image_storage_consent": client.image_storage_consent,
-                "image_storage_consented_at": client.image_storage_consented_at,
-                "next_action": "dashboard",
-                "client": _serialize_client_summary(client),
-            }
-        )
+        return Response(_serialize_client_auth_payload(client, include_token=False))
 
 
 class RegisterView(ClientContextAPIView):
@@ -227,7 +218,7 @@ class ClientProfileView(ClientContextAPIView):
     @extend_schema(summary="Get current client profile", responses={200: ClientSerializer})
     def get(self, request):
         client = _resolve_client_from_request(request, required=True)
-        return Response({"status": "success", "client": ClientSerializer(client).data})
+        return Response(_serialize_client_auth_payload(client, include_token=False))
 
 
 class SurveyView(ClientContextAPIView):

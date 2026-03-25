@@ -84,7 +84,9 @@ class ReadyIssueHardeningTests(APITestCase):
         self.assertTrue(found_response.data["is_existing"])
         self.assertTrue(found_response.data["is_authenticated"])
         self.assertEqual(found_response.data["next_action"], "dashboard")
+        self.assertEqual(found_response.data["nextAction"], "dashboard")
         self.assertEqual(found_response.data["client"]["name"], "Existing Client")
+        self.assertEqual(found_response.data["clientSummary"]["name"], "Existing Client")
 
         missing_response = self.client.post(
             "/api/v1/auth/check/",
@@ -95,6 +97,33 @@ class ReadyIssueHardeningTests(APITestCase):
         self.assertFalse(missing_response.data["is_existing"])
         self.assertFalse(missing_response.data["is_authenticated"])
         self.assertEqual(missing_response.data["next_action"], "register")
+        self.assertEqual(missing_response.data["nextAction"], "register")
+
+    def test_client_login_and_me_share_common_contract_fields(self):
+        client = Client.objects.create(name="Parity Client", phone="01078880000", gender="F")
+
+        login_response = self.client.post(
+            "/api/v1/auth/login/",
+            {"phone": client.phone},
+            format="json",
+        )
+        self.assertEqual(login_response.status_code, status.HTTP_200_OK)
+        self.assertTrue(login_response.data["is_authenticated"])
+        self.assertEqual(login_response.data["next_action"], "dashboard")
+        self.assertEqual(login_response.data["nextAction"], "dashboard")
+        self.assertIn("access_token", login_response.data)
+        self.assertEqual(login_response.data["clientSummary"]["name"], "Parity Client")
+
+        me_response = self.client.get(
+            "/api/v1/auth/me/",
+            HTTP_AUTHORIZATION=f"Bearer {login_response.data['access_token']}",
+        )
+        self.assertEqual(me_response.status_code, status.HTTP_200_OK)
+        self.assertTrue(me_response.data["is_authenticated"])
+        self.assertTrue(me_response.data["is_existing"])
+        self.assertEqual(me_response.data["next_action"], "dashboard")
+        self.assertEqual(me_response.data["nextAction"], "dashboard")
+        self.assertEqual(me_response.data["client"]["name"], "Parity Client")
 
     def test_survey_accepts_frontend_style_selections_payload(self):
         client = Client.objects.create(name="Survey Client", phone="01070101010", gender="F")

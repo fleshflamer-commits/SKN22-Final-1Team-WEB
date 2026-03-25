@@ -884,10 +884,13 @@ def get_client_recommendation_report(*, client: Client, admin: AdminAccount | No
     ]
     primary_batch_row = batch_rows[0] if batch_rows else latest_generated
     today_style_id = None
+    today_style_source = None
     if final_selected:
         today_style_id = final_selected.style_id_snapshot
+        today_style_source = "confirmed_selection"
     elif primary_batch_row:
         today_style_id = primary_batch_row.style_id_snapshot
+        today_style_source = "batch_rank_1"
     today_style = (
         _serialize_frontend_style(
             style_id=today_style_id,
@@ -898,6 +901,10 @@ def get_client_recommendation_report(*, client: Client, admin: AdminAccount | No
         if today_style_id is not None
         else None
     )
+    if today_style is not None:
+        today_style["sourceRule"] = today_style_source
+        today_style["source_rule"] = today_style_source
+        today_style["rank"] = 1 if today_style_source == "batch_rank_1" else None
     survey_results = _build_admin_survey_results(
         survey=latest_survey,
         survey_snapshot=(latest_consultation.survey_snapshot if latest_consultation else None),
@@ -935,9 +942,15 @@ def get_client_recommendation_report(*, client: Client, admin: AdminAccount | No
         "final_selected_style": (_serialize_recommendation(final_selected) if final_selected else None),
         "today_style": today_style,
         "todayStyle": today_style,
+        "today_style_source": today_style_source,
+        "todayStyleSource": today_style_source,
         "recommended_styles": frontend_styles,
         "recommendedStyles": frontend_styles,
+        "recommended_styles_purpose": "frontend_style_cards",
+        "recommendedStylesPurpose": "frontend_style_cards",
         "items": recommendation_items,
+        "items_purpose": "raw_recommendation_rows",
+        "itemsPurpose": "raw_recommendation_rows",
         "recommendation_mode": recommendation_mode,
         "recommendationMode": recommendation_mode,
         "capture_required_for_full_result": capture_required_for_full_result,
