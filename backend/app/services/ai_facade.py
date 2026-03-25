@@ -1,6 +1,7 @@
-import json
+﻿import json
 import logging
 import os
+import base64
 from types import SimpleNamespace
 from urllib import error, request
 
@@ -34,8 +35,11 @@ def _post_json(path: str, payload: dict) -> dict | None:
         return None
 
 
-def simulate_face_analysis(*, image_url: str | None = None) -> dict:
-    remote = _post_json("/internal/analyze-face", {"image_url": image_url})
+def simulate_face_analysis(*, image_url: str | None = None, image_bytes: bytes | None = None) -> dict:
+    payload = {"image_url": image_url}
+    if image_bytes is not None:
+        payload["image_base64"] = base64.b64encode(image_bytes).decode("ascii")
+    remote = _post_json("/internal/analyze-face", payload)
     if remote:
         return remote
     return {
@@ -47,7 +51,7 @@ def simulate_face_analysis(*, image_url: str | None = None) -> dict:
 
 def generate_recommendation_batch(
     *,
-    customer_id: int,
+    client_id: int,
     survey_data: dict | None,
     analysis_data: dict,
     styles_by_id: dict[int, object] | None = None,
@@ -55,7 +59,7 @@ def generate_recommendation_batch(
     remote = _post_json(
         "/internal/generate-simulations",
         {
-            "customer_id": customer_id,
+            "client_id": client_id,
             "survey_data": survey_data or {},
             "analysis_data": analysis_data,
         },
@@ -63,7 +67,7 @@ def generate_recommendation_batch(
     if remote and isinstance(remote.get("items"), list):
         return remote["items"]
 
-    survey = SimpleNamespace(customer_id=customer_id, **(survey_data or {}))
+    survey = SimpleNamespace(client_id=client_id, **(survey_data or {}))
     analysis = SimpleNamespace(**analysis_data)
     return score_recommendations(survey=survey, analysis=analysis, styles_by_id=styles_by_id)
 
@@ -80,3 +84,4 @@ def explain_style(*, card: dict) -> dict:
         "llm_explanation": card.get("llm_explanation"),
         "keywords": card.get("keywords", []),
     }
+

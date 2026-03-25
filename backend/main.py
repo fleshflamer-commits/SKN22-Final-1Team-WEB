@@ -1,4 +1,4 @@
-from types import SimpleNamespace
+﻿from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.openapi.utils import get_openapi
@@ -29,6 +29,7 @@ app.openapi = custom_openapi
 
 class AnalyzeFaceRequest(BaseModel):
     image_url: str | None = None
+    image_base64: str | None = None
 
 
 class AnalyzeFaceResponse(BaseModel):
@@ -38,7 +39,7 @@ class AnalyzeFaceResponse(BaseModel):
 
 
 class GenerateSimulationsRequest(BaseModel):
-    customer_id: int
+    client_id: int
     survey_data: dict = Field(default_factory=dict)
     analysis_data: dict
 
@@ -61,7 +62,7 @@ class ExplainStyleResponse(BaseModel):
     keywords: list[str] = Field(default_factory=list)
 
 
-def _simulate_face_analysis(image_url: str | None = None) -> dict:
+def _simulate_face_analysis(image_url: str | None = None, image_base64: str | None = None) -> dict:
     return {
         "face_shape": "Oval",
         "golden_ratio_score": 0.92,
@@ -85,12 +86,12 @@ async def internal_health():
 
 @app.post("/internal/analyze-face", response_model=AnalyzeFaceResponse)
 async def analyze_face(payload: AnalyzeFaceRequest):
-    return _simulate_face_analysis(image_url=payload.image_url)
+    return _simulate_face_analysis(image_url=payload.image_url, image_base64=payload.image_base64)
 
 
 @app.post("/internal/generate-simulations", response_model=GenerateSimulationsResponse)
 async def generate_simulations(payload: GenerateSimulationsRequest):
-    survey = SimpleNamespace(customer_id=payload.customer_id, **(payload.survey_data or {}))
+    survey = SimpleNamespace(client_id=payload.client_id, **(payload.survey_data or {}))
     analysis = SimpleNamespace(**payload.analysis_data)
     items = score_recommendations(survey=survey, analysis=analysis)
     return {"status": "ready", "items": items}
@@ -107,3 +108,4 @@ async def explain_style(payload: ExplainStyleRequest):
         "llm_explanation": card.get("llm_explanation"),
         "keywords": card.get("keywords", []),
     }
+

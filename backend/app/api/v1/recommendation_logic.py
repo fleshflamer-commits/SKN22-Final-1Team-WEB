@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+﻿from dataclasses import dataclass
 from typing import Iterable
 
 
@@ -140,7 +140,7 @@ def canonical_length(value: str | None) -> str:
     value = _normalize_text(value)
     if _contains_any(value, ("숏", "쇼트", "short")):
         return "short"
-    if _contains_any(value, ("단발", "보브", "bob", "lob")):
+    if _contains_any(value, ("보브", "단발", "bob", "lob")):
         return "bob"
     if _contains_any(value, ("중단발", "미디", "medium", "semilong", "semi")):
         return "medium"
@@ -192,9 +192,9 @@ def canonical_budget(value: str | None) -> str:
     value = _normalize_text(value)
     if _contains_any(value, ("3만원이하", "3만이하", "below3")):
         return "low"
-    if _contains_any(value, ("3만~5만", "3만에서5만", "5만원이하", "from3to5")):
+    if _contains_any(value, ("3만5만", "3만에서5만", "5만원이하", "from3to5")):
         return "mid"
-    if _contains_any(value, ("5만~10만", "5만에서10만", "10만원이하", "from5to10", "10만")):
+    if _contains_any(value, ("5만10만", "5만에서10만", "10만원이하", "from5to10", "10만")):
         return "high"
     if _contains_any(value, ("10만원이상", "10만이상", "over10")):
         return "high"
@@ -205,11 +205,11 @@ def canonical_face_shape(value: str | None) -> str:
     value = _normalize_text(value)
     if _contains_any(value, ("둥근", "round")):
         return "round"
-    if _contains_any(value, ("타원", "계란", "oval")):
+    if _contains_any(value, ("계란", "타원", "oval")):
         return "oval"
     if _contains_any(value, ("긴", "long")):
         return "long"
-    if _contains_any(value, ("각", "square")):
+    if _contains_any(value, ("각진", "square")):
         return "square"
     if _contains_any(value, ("역삼각", "triangle", "heart")):
         return "triangle"
@@ -253,10 +253,10 @@ def infer_ratio_mode(score: float | None) -> str:
 def ratio_message(score: float | None) -> str:
     mode = infer_ratio_mode(score)
     if mode == "expose":
-        return "얼굴 비율이 안정적이라 라인을 드러내는 스타일도 잘 어울립니다."
+        return "Your facial balance is strong enough to suit styles that reveal the face line more clearly."
     if mode == "cover":
-        return "옆선과 앞선을 부드럽게 감싸는 스타일이 보완 효과가 좋습니다."
-    return "과한 노출보다 균형 잡힌 프레임감이 안정적입니다."
+        return "A style with softer framing will help balance the side line and contour."
+    return "A balanced silhouette is likely to feel more natural than a highly exposed line."
 
 
 def score_recommendations(*, survey, analysis, styles_by_id: dict[int, object] | None = None) -> list[dict]:
@@ -304,7 +304,7 @@ def score_recommendations(*, survey, analysis, styles_by_id: dict[int, object] |
             ratio_score=ratio_score,
         )
 
-        customer_key = getattr(survey, "customer_id", getattr(survey, "customer", "0"))
+        client_key = getattr(survey, "client_id", getattr(survey, "client", "0"))
         results.append(
             {
                 "source": "generated",
@@ -313,11 +313,24 @@ def score_recommendations(*, survey, analysis, styles_by_id: dict[int, object] |
                 "style_description": style_description,
                 "keywords": list(profile.keywords),
                 "sample_image_url": sample_image_url,
-                "simulation_image_url": f"/media/synthetic/{customer_key}_{profile.style_id}.jpg",
-                "synthetic_image_url": f"/media/synthetic/{customer_key}_{profile.style_id}.jpg",
+                "simulation_image_url": f"/media/synthetic/{client_key}_{profile.style_id}.jpg",
+                "synthetic_image_url": f"/media/synthetic/{client_key}_{profile.style_id}.jpg",
                 "llm_explanation": explanation,
                 "reasoning": f"face {face_score:.1f}/40 | ratio {ratio_component:.1f}/20 | preference {preference_score:.1f}/40"
                 + (f" | penalty -{penalty:.1f}" if penalty else ""),
+                "reasoning_snapshot": {
+                    "summary": f"face {face_score:.1f}/40 | ratio {ratio_component:.1f}/20 | preference {preference_score:.1f}/40"
+                    + (f" | penalty -{penalty:.1f}" if penalty else ""),
+                    "face_shape": face_shape,
+                    "ratio_mode": ratio_mode,
+                    "face_score": round(face_score, 1),
+                    "ratio_score": round(ratio_component, 1),
+                    "preference_score": round(preference_score, 1),
+                    "penalty": round(penalty, 1),
+                    "total_score": total,
+                    "matched_labels": match_labels,
+                    "style_keywords": list(profile.keywords),
+                },
                 "match_score": total,
             }
         )
@@ -338,18 +351,18 @@ def build_llm_explanation(
 ) -> str:
     face_label = {
         "round": "둥근형",
-        "oval": "타원형",
+        "oval": "계란형",
         "long": "긴형",
         "square": "각진형",
         "triangle": "역삼각형",
         "unknown": "중립형",
     }.get(face_shape, "중립형")
     if matched_labels:
-        preference_text = "취향 요소(" + ", ".join(matched_labels) + ")와의 일치도가 높습니다."
+        preference_text = "The style also aligns well with your preference signals (" + ", ".join(matched_labels) + ")."
     else:
-        preference_text = "설문 정보가 적어 얼굴 분석 비중을 더 크게 반영했습니다."
+        preference_text = "Preference data is limited, so the face analysis score carries more weight in this result."
     return (
-        f"{style_name}은 {face_label} 얼굴형을 기준으로 추천된 스타일입니다. "
+        f"{style_name} is recommended as a strong match for a {face_label} profile. "
         f"{style_description} {preference_text} {ratio_message(ratio_score)}"
     )
 
@@ -413,3 +426,4 @@ def _score_penalty(*, length_tag: str, vibe_tag: str, profile: StyleProfile, pre
     if preference_score < 10.0:
         penalty += 2.0
     return penalty
+

@@ -1,31 +1,45 @@
-from django.db import models
+﻿from django.db import models
+
+from app.services.age_profile import build_age_profile
 
 
-class Customer(models.Model):
+class Client(models.Model):
     name = models.CharField(max_length=50)
     gender = models.CharField(max_length=10, null=True, blank=True)
     phone = models.CharField(max_length=20, unique=True, db_index=True)
+    age_input = models.PositiveSmallIntegerField(null=True, blank=True)
+    birth_year_estimate = models.PositiveSmallIntegerField(null=True, blank=True, db_index=True)
+    image_storage_consent = models.BooleanField(default=False)
+    image_storage_consented_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        db_table = "customers"
+        db_table = "clients"
 
     def __str__(self):
         return f"{self.name} ({self.phone})"
 
+    @property
+    def age_profile(self) -> dict | None:
+        return build_age_profile(birth_year_estimate=self.birth_year_estimate)
 
-class Partner(models.Model):
+
+class AdminAccount(models.Model):
     name = models.CharField(max_length=50)
     store_name = models.CharField(max_length=100)
     role = models.CharField(max_length=20, default="owner")
     phone = models.CharField(max_length=20, unique=True, db_index=True)
     business_number = models.CharField(max_length=30, unique=True, db_index=True)
     password_hash = models.CharField(max_length=255)
+    business_verification_status = models.CharField(max_length=30, default="checksum_only")
+    business_verification_snapshot = models.JSONField(default=dict, blank=True)
+    consent_snapshot = models.JSONField(default=dict, blank=True)
+    consented_at = models.DateTimeField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        db_table = "partners"
+        db_table = "admin_accounts"
 
     def __str__(self):
         return f"{self.store_name} - {self.name}"
@@ -46,8 +60,8 @@ class Style(models.Model):
 
 
 class Survey(models.Model):
-    customer = models.OneToOneField(
-        Customer,
+    client = models.OneToOneField(
+        Client,
         on_delete=models.CASCADE,
         related_name="survey",
         db_index=True,
@@ -65,17 +79,20 @@ class Survey(models.Model):
 
 
 class CaptureRecord(models.Model):
-    customer = models.ForeignKey(
-        Customer,
+    client = models.ForeignKey(
+        Client,
         on_delete=models.CASCADE,
         related_name="captures",
         db_index=True,
     )
-    original_path = models.CharField(max_length=500)
-    processed_path = models.CharField(max_length=500)
-    filename = models.CharField(max_length=255)
+    original_path = models.CharField(max_length=500, null=True, blank=True)
+    processed_path = models.CharField(max_length=500, null=True, blank=True)
+    filename = models.CharField(max_length=255, null=True, blank=True)
     status = models.CharField(max_length=50, default="PENDING", db_index=True)
     face_count = models.IntegerField(null=True, blank=True)
+    landmark_snapshot = models.JSONField(null=True, blank=True)
+    deidentified_path = models.CharField(max_length=500, null=True, blank=True)
+    privacy_snapshot = models.JSONField(null=True, blank=True)
     error_note = models.TextField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -85,8 +102,8 @@ class CaptureRecord(models.Model):
 
 
 class FaceAnalysis(models.Model):
-    customer = models.ForeignKey(
-        Customer,
+    client = models.ForeignKey(
+        Client,
         on_delete=models.CASCADE,
         related_name="face_analyses",
         db_index=True,
@@ -94,6 +111,7 @@ class FaceAnalysis(models.Model):
     face_shape = models.CharField(max_length=50, null=True, blank=True)
     golden_ratio_score = models.FloatField(null=True, blank=True)
     image_url = models.CharField(max_length=500, null=True, blank=True)
+    landmark_snapshot = models.JSONField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -101,8 +119,8 @@ class FaceAnalysis(models.Model):
 
 
 class FormerRecommendation(models.Model):
-    customer = models.ForeignKey(
-        Customer,
+    client = models.ForeignKey(
+        Client,
         on_delete=models.CASCADE,
         related_name="former_recommendations",
         db_index=True,
@@ -129,7 +147,9 @@ class FormerRecommendation(models.Model):
     keywords = models.JSONField(default=list, blank=True)
     sample_image_url = models.CharField(max_length=500, null=True, blank=True)
     simulation_image_url = models.CharField(max_length=500, null=True, blank=True)
+    regeneration_snapshot = models.JSONField(null=True, blank=True)
     llm_explanation = models.TextField(null=True, blank=True)
+    reasoning_snapshot = models.JSONField(null=True, blank=True)
     match_score = models.FloatField(null=True, blank=True)
     rank = models.PositiveSmallIntegerField(default=1)
     is_chosen = models.BooleanField(default=False, db_index=True)
@@ -144,8 +164,8 @@ class FormerRecommendation(models.Model):
 
 
 class StyleSelection(models.Model):
-    customer = models.ForeignKey(
-        Customer,
+    client = models.ForeignKey(
+        Client,
         on_delete=models.CASCADE,
         related_name="style_selections",
         db_index=True,
@@ -161,7 +181,7 @@ class StyleSelection(models.Model):
     source = models.CharField(max_length=30, default="current_recommendations")
     survey_snapshot = models.JSONField(null=True, blank=True)
     match_score = models.FloatField(null=True, blank=True)
-    is_sent_to_designer = models.BooleanField(default=False)
+    is_sent_to_admin = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -169,14 +189,14 @@ class StyleSelection(models.Model):
 
 
 class ConsultationRequest(models.Model):
-    customer = models.ForeignKey(
-        Customer,
+    client = models.ForeignKey(
+        Client,
         on_delete=models.CASCADE,
         related_name="consultations",
         db_index=True,
     )
-    partner = models.ForeignKey(
-        Partner,
+    admin = models.ForeignKey(
+        AdminAccount,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -203,20 +223,20 @@ class ConsultationRequest(models.Model):
         db_table = "consultation_requests"
 
 
-class CustomerSessionNote(models.Model):
+class ClientSessionNote(models.Model):
     consultation = models.ForeignKey(
         ConsultationRequest,
         on_delete=models.CASCADE,
         related_name="notes",
     )
-    customer = models.ForeignKey(
-        Customer,
+    client = models.ForeignKey(
+        Client,
         on_delete=models.CASCADE,
         related_name="session_notes",
         db_index=True,
     )
-    partner = models.ForeignKey(
-        Partner,
+    admin = models.ForeignKey(
+        AdminAccount,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -226,4 +246,5 @@ class CustomerSessionNote(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        db_table = "customer_session_notes"
+        db_table = "client_session_notes"
+
