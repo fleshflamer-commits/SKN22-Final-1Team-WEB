@@ -655,6 +655,85 @@ class BackendIssueProgressTests(APITestCase):
         self.assertEqual(trend_after_cancel.status_code, status.HTTP_200_OK)
         self.assertEqual(trend_after_cancel.data["trendReport"], [])
 
+    def test_confirm_is_idempotent_for_same_active_request(self):
+        client = Client.objects.create(name="Repeat Confirm Tester", phone="01081818888", gender="F")
+        admin = AdminAccount.objects.create(
+            name="Manager Repeat",
+            store_name="MirrAI Repeat",
+            role="owner",
+            phone="01011112223",
+            business_number=build_valid_business_number("456789014"),
+            password_hash="hashed",
+            consent_snapshot={
+                "agree_terms": True,
+                "agree_privacy": True,
+                "agree_third_party_sharing": True,
+            },
+        )
+        survey = Survey.objects.create(
+            client=client,
+            target_length="medium",
+            target_vibe="soft",
+            scalp_type="normal",
+            hair_colour="brown",
+            budget_range="10-15",
+            preference_vector=[1.0] * 20,
+        )
+        capture = CaptureRecord.objects.create(
+            client=client,
+            original_path=None,
+            processed_path=None,
+            filename=None,
+            status="DONE",
+            face_count=1,
+            privacy_snapshot={"storage_policy": "vector_only"},
+        )
+        analysis = FaceAnalysis.objects.create(
+            client=client,
+            face_shape="Oval",
+            golden_ratio_score=0.88,
+            image_url=None,
+            landmark_snapshot={"version": "coarse-v1"},
+        )
+        _, rows = persist_generated_batch(
+            client=client,
+            capture_record=capture,
+            survey=survey,
+            analysis=analysis,
+        )
+
+        first_response = self.client.post(
+            "/api/v1/analysis/confirm/",
+            {
+                "client_id": client.id,
+                "recommendation_id": rows[0].id,
+                "admin_id": admin.id,
+                "source": "current_recommendations",
+                "direct_consultation": False,
+            },
+            format="json",
+        )
+        second_response = self.client.post(
+            "/api/v1/analysis/confirm/",
+            {
+                "client_id": client.id,
+                "recommendation_id": rows[0].id,
+                "admin_id": admin.id,
+                "source": "current_recommendations",
+                "direct_consultation": False,
+            },
+            format="json",
+        )
+
+        self.assertEqual(first_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(second_response.status_code, status.HTTP_200_OK)
+        self.assertFalse(first_response.data["idempotent"])
+        self.assertTrue(second_response.data["idempotent"])
+        self.assertEqual(first_response.data["consultation_id"], second_response.data["consultation_id"])
+        self.assertEqual(ConsultationRequest.objects.filter(client=client).count(), 1)
+        self.assertEqual(ConsultationRequest.objects.filter(client=client, is_active=True).count(), 1)
+        self.assertEqual(StyleSelection.objects.filter(client=client, is_sent_to_admin=True).count(), 1)
+
     def test_admin_contract_endpoints_include_frontend_friendly_aliases(self):
         client = Client.objects.create(
             name="Admin Contract Tester",

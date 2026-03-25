@@ -790,16 +790,6 @@ def confirm_style_selection(
         selected_row = FormerRecommendation.objects.filter(id=recommendation_id, client=client).first()
         if not selected_row:
             raise ValueError("The selected recommendation could not be found.")
-
-        FormerRecommendation.objects.filter(client=client, batch_id=selected_row.batch_id).update(
-            is_chosen=False,
-            chosen_at=None,
-        )
-        selected_row.is_chosen = True
-        selected_row.chosen_at = timezone.now()
-        selected_row.is_sent_to_admin = True
-        selected_row.sent_at = timezone.now()
-        selected_row.save(update_fields=["is_chosen", "chosen_at", "is_sent_to_admin", "sent_at"])
         style_id = selected_row.style_id_snapshot
         selected_style = selected_row.style or Style.objects.filter(id=style_id).first()
 
@@ -816,83 +806,127 @@ def confirm_style_selection(
             .order_by("-created_at")
             .first()
         )
-        if selected_row:
+
+    if not direct_consultation and selected_style is None:
+        raise ValueError("Style information is required to confirm a selection.")
+
+    active_consultation = (
+        ConsultationRequest.objects.filter(client=client, is_active=True)
+        .select_related("selected_style", "selected_recommendation")
+        .order_by("-created_at")
+        .first()
+    )
+    target_style_id = None if direct_consultation else (selected_style.id if selected_style else None)
+    target_recommendation_id = selected_row.id if selected_row else None
+    is_same_active_request = bool(
+        active_consultation
+        and active_consultation.source == source
+        and active_consultation.admin_id == (admin.id if admin else None)
+        and active_consultation.selected_style_id == target_style_id
+        and active_consultation.selected_recommendation_id == target_recommendation_id
+        and active_consultation.status in {"PENDING", "IN_PROGRESS"}
+    )
+
+    if is_same_active_request:
+        consultation = active_consultation
+    else:
+        chosen_at = timezone.now()
+        if selected_row is not None:
             FormerRecommendation.objects.filter(client=client, batch_id=selected_row.batch_id).update(
                 is_chosen=False,
                 chosen_at=None,
             )
             selected_row.is_chosen = True
-            selected_row.chosen_at = timezone.now()
+            selected_row.chosen_at = chosen_at
             selected_row.is_sent_to_admin = True
-            selected_row.sent_at = timezone.now()
+            selected_row.sent_at = chosen_at
             selected_row.save(update_fields=["is_chosen", "chosen_at", "is_sent_to_admin", "sent_at"])
 
-    if not direct_consultation and selected_style is None:
-        raise ValueError("Style information is required to confirm a selection.")
+        if recommendation_id is None and selected_style is not None and source == "trend":
+            explanation = selected_style.description or "This style was selected from the current salon trend list."
+            regeneration_snapshot = build_recommendation_regeneration_snapshot(
+                client=client,
+                survey=(get_latest_survey(client) or build_default_survey_context(client.id)),
+                analysis=latest_analysis,
+                source="trend",
+            )
+            selected_row = FormerRecommendation.objects.create(
+                client=client,
+                style=selected_style,
+                batch_id=uuid.uuid4(),
+                source="trend",
+                style_id_snapshot=selected_style.id,
+                style_name_snapshot=selected_style.name,
+                style_description_snapshot=selected_style.description or "",
+                keywords=[selected_style.vibe] if selected_style.vibe else [],
+                sample_image_url=None,
+                simulation_image_url=None,
+                regeneration_snapshot=regeneration_snapshot,
+                llm_explanation=explanation,
+                reasoning_snapshot={
+                    "summary": "trend selection promoted to consultation",
+                    "source": "trend",
+                },
+                match_score=None,
+                rank=1,
+                is_chosen=not direct_consultation,
+                chosen_at=(chosen_at if not direct_consultation else None),
+                is_sent_to_admin=True,
+                sent_at=chosen_at,
+            )
 
-    if recommendation_id is None and selected_style is not None and source == "trend":
-        explanation = selected_style.description or "This style was selected from the current salon trend list."
-        regeneration_snapshot = build_recommendation_regeneration_snapshot(
-            client=client,
-            survey=(get_latest_survey(client) or build_default_survey_context(client.id)),
-            analysis=latest_analysis,
-            source="trend",
-        )
-        selected_row = FormerRecommendation.objects.create(
-            client=client,
-            style=selected_style,
-            batch_id=uuid.uuid4(),
-            source="trend",
-            style_id_snapshot=selected_style.id,
-            style_name_snapshot=selected_style.name,
-            style_description_snapshot=selected_style.description or "",
-            keywords=[selected_style.vibe] if selected_style.vibe else [],
-            sample_image_url=None,
-            simulation_image_url=None,
-            regeneration_snapshot=regeneration_snapshot,
-            llm_explanation=explanation,
-            reasoning_snapshot={
-                "summary": "trend selection promoted to consultation",
-                "source": "trend",
-            },
-            match_score=None,
-            rank=1,
-            is_chosen=not direct_consultation,
-            chosen_at=(timezone.now() if not direct_consultation else None),
-            is_sent_to_admin=True,
-            sent_at=timezone.now(),
+        if not direct_consultation and selected_style is not None:
+            selection_queryset = StyleSelection.objects.filter(
+                client=client,
+                style_id=selected_style.id,
+                source=source,
+            )
+            if selected_row is not None:
+                selection_queryset = selection_queryset.filter(selected_recommendation=selected_row)
+            existing_selection = selection_queryset.order_by("-created_at").first()
+            if existing_selection is not None and not existing_selection.is_sent_to_admin:
+                existing_selection.selected_recommendation = selected_row
+                existing_selection.survey_snapshot = survey_snapshot
+                existing_selection.match_score = selected_row.match_score if selected_row else None
+                existing_selection.is_sent_to_admin = True
+                existing_selection.save(
+                    update_fields=[
+                        "selected_recommendation",
+                        "survey_snapshot",
+                        "match_score",
+                        "is_sent_to_admin",
+                    ]
+                )
+            else:
+                StyleSelection.objects.create(
+                    client=client,
+                    selected_recommendation=selected_row,
+                    style_id=selected_style.id,
+                    source=source,
+                    survey_snapshot=survey_snapshot,
+                    match_score=(selected_row.match_score if selected_row else None),
+                    is_sent_to_admin=True,
+                )
+
+        ConsultationRequest.objects.filter(client=client, is_active=True).update(
+            is_active=False,
+            status="CLOSED",
+            closed_at=chosen_at,
+            is_read=True,
         )
 
-    if not direct_consultation and selected_style is not None:
-        StyleSelection.objects.create(
+        consultation = ConsultationRequest.objects.create(
             client=client,
+            selected_style=(None if direct_consultation else selected_style),
             selected_recommendation=selected_row,
-            style_id=selected_style.id,
+            admin=admin,
             source=source,
             survey_snapshot=survey_snapshot,
-            match_score=(selected_row.match_score if selected_row else None),
-            is_sent_to_admin=True,
+            analysis_data_snapshot=analysis_snapshot,
+            status="PENDING",
+            is_active=True,
+            is_read=False,
         )
-
-    ConsultationRequest.objects.filter(client=client, is_active=True).update(
-        is_active=False,
-        status="CLOSED",
-        closed_at=timezone.now(),
-        is_read=True,
-    )
-
-    consultation = ConsultationRequest.objects.create(
-        client=client,
-        selected_style=(None if direct_consultation else selected_style),
-        selected_recommendation=selected_row,
-        admin=admin,
-        source=source,
-        survey_snapshot=survey_snapshot,
-        analysis_data_snapshot=analysis_snapshot,
-        status="PENDING",
-        is_active=True,
-        is_read=False,
-    )
 
     return {
         "status": "success",
@@ -908,6 +942,7 @@ def confirm_style_selection(
         "source": source,
         "direct_consultation": direct_consultation,
         "recommendation_id": (selected_row.id if selected_row else None),
+        "idempotent": is_same_active_request,
         "message": (
             "A direct consultation request has been sent to the admin."
             if direct_consultation
@@ -1001,6 +1036,7 @@ def cancel_style_selection(
         "interactionStatus": "selection_cancelled",
         "consultation_status": "CANCELLED",
         "consultationStatus": "CANCELLED",
+        "idempotent": not ConsultationRequest.objects.filter(client=client, is_active=True).exists() and selected_row is None,
         "message": "The selected style has been cancelled and the flow can return to the client input step.",
     }
 
