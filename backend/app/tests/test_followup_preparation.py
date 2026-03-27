@@ -7,18 +7,27 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from app.api.v1.admin_auth import build_admin_refresh_token, build_client_refresh_token, get_admin_auth_policy_snapshot
-from app.api.v1.response_helpers import get_error_contract_snapshot
+from app.api.v1.response_helpers import detail_response, get_error_contract_snapshot
 from app.api.v1.services_django import persist_generated_batch
 from app.models_django import AdminAccount, CaptureRecord, Client, FaceAnalysis, Survey
 
 
 class ContractPreparationSnapshotTests(SimpleTestCase):
-    def test_error_contract_snapshot_reports_current_detail_mode(self):
+    def test_error_contract_snapshot_reports_current_compat_envelope_mode(self):
         payload = get_error_contract_snapshot()
 
-        self.assertEqual(payload["mode"], "drf_detail")
-        self.assertEqual(payload["fields"], ["detail"])
-        self.assertFalse(payload["envelope_supported"])
+        self.assertEqual(payload["mode"], "compat_envelope")
+        self.assertEqual(payload["fields"], ["error_code", "message", "detail"])
+        self.assertTrue(payload["detail_compatibility"])
+        self.assertTrue(payload["validation_detail_supported"])
+        self.assertTrue(payload["envelope_supported"])
+
+    def test_detail_response_keeps_legacy_detail_field(self):
+        response = detail_response("Phone number is required.", error_code="validation_error")
+
+        self.assertEqual(response.data["error_code"], "validation_error")
+        self.assertEqual(response.data["message"], "Phone number is required.")
+        self.assertEqual(response.data["detail"], "Phone number is required.")
 
     def test_admin_auth_policy_snapshot_reports_refresh_support(self):
         payload = get_admin_auth_policy_snapshot()
@@ -281,6 +290,18 @@ class RetryRecommendationFlowTests(APITestCase):
 
 
 class RefreshTokenEndpointTests(APITestCase):
+    def test_client_refresh_validation_error_uses_compat_envelope(self):
+        response = self.client.post(
+            "/api/v1/auth/refresh/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data["error_code"], "validation_error")
+        self.assertEqual(response.data["message"], "Validation failed.")
+        self.assertIn("refresh_token", response.data["detail"])
+
     def test_client_refresh_endpoint_returns_new_tokens(self):
         client = Client.objects.create(name="Client Refresh", phone="01056565656", gender="F")
         refresh_token = build_client_refresh_token(client=client)
@@ -296,6 +317,18 @@ class RefreshTokenEndpointTests(APITestCase):
         self.assertIn("access_token", response.data)
         self.assertIn("refresh_token", response.data)
         self.assertGreater(response.data["refresh_expires_in"], response.data["expires_in"])
+
+    def test_client_refresh_invalid_token_uses_compat_envelope(self):
+        response = self.client.post(
+            "/api/v1/auth/refresh/",
+            {"refresh_token": "invalid-token"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(response.data["error_code"], "authentication_failed")
+        self.assertIn("message", response.data)
+        self.assertIn("detail", response.data)
 
     def test_admin_refresh_endpoint_returns_new_tokens(self):
         admin = AdminAccount.objects.create(
@@ -319,3 +352,15 @@ class RefreshTokenEndpointTests(APITestCase):
         self.assertIn("access_token", response.data)
         self.assertIn("refresh_token", response.data)
         self.assertGreater(response.data["refresh_expires_in"], response.data["expires_in"])
+
+    def test_admin_refresh_validation_error_uses_compat_envelope(self):
+        response = self.client.post(
+            "/api/v1/admin/auth/refresh/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data["error_code"], "validation_error")
+        self.assertEqual(response.data["message"], "Validation failed.")
+        self.assertIn("refresh_token", response.data["detail"])

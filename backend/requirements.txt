@@ -30,7 +30,6 @@ passlib[bcrypt]>=1.7,<1.8
 
 # --- API 문서화 및 운영 ---
 drf-spectacular>=0.27,<0.29
-apscheduler==3.10.4
 beautifulsoup4==4.12.3
 playwright==1.42.0
 google-genai==0.2.2
